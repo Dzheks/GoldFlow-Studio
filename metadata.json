@@ -1,0 +1,6 @@
+{
+  "name": "GoldFlow Studio - Видеостудия и Контент-завод",
+  "description": "Единая AI-студия для создания видеоконтента: Контент-завод сценариев, пакетная генерация промптов, генератор картинок и видео, озвучка и встроенный нелинейный монтаж.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
