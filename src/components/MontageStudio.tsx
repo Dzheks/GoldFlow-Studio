@@ -605,7 +605,7 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
       {/* Main Workspace: 3-column layout (Left Tabs & Controls, Center Canvas Player, Right Inspector) */}
       <div className="flex-1 grid grid-cols-12 gap-0 overflow-hidden min-h-[460px]">
         {/* Left Column: Project assembly tabs & controls (3 cols) */}
-        <div className="col-span-12 md:col-span-3 border-r border-[#261d15] bg-[#120e0a] p-4 flex flex-col overflow-y-auto max-h-[calc(100vh-120px)]">
+        <div className="col-span-12 md:col-span-2 border-r border-[#261d15] bg-[#120e0a] p-4 flex flex-col overflow-y-auto max-h-[calc(100vh-120px)]">
           <div className="space-y-3">
             {/* Tabs */}
             <div className="flex items-center gap-1 border-b border-[#251b13] pb-2 text-xs">
@@ -873,17 +873,17 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
         </div>
 
         {/* Center Column: Video Preview Player (6 cols on lg) */}
-        <div className="col-span-12 md:col-span-6 bg-[#0a0806] flex flex-col justify-between p-3 relative">
+        <div className="col-span-12 md:col-span-8 bg-[#0a0806] flex flex-col justify-between p-3 relative">
           {/* Canvas Viewport with Framing Box — shrank to fit 1080p laptops
               without vertical scroll (was 620/380/500 max, ~25% smaller now). */}
-          <div className="flex-1 flex items-center justify-center relative min-h-[180px]">
+          <div className="flex-1 flex items-center justify-center relative min-h-[300px]">
             <div
               className={`relative border-2 border-dashed border-[#57432b] rounded-lg overflow-hidden shadow-2xl transition-all ${
-                aspectRatio === '16:9' ? 'w-full max-w-[360px] aspect-video' :
-                aspectRatio === '9:16' ? 'h-full max-h-[240px] aspect-[9/16]' :
-                aspectRatio === '4:3' ? 'w-full max-w-[300px] aspect-[4/3]' :
-                aspectRatio === '3:4' ? 'h-full max-h-[240px] aspect-[3/4]' :
-                'w-full max-w-[240px] aspect-square'
+                aspectRatio === '16:9' ? 'w-full max-w-[900px] aspect-video' :
+                aspectRatio === '9:16' ? 'h-full max-h-[500px] aspect-[9/16]' :
+                aspectRatio === '4:3' ? 'w-full max-w-[720px] aspect-[4/3]' :
+                aspectRatio === '3:4' ? 'h-full max-h-[500px] aspect-[3/4]' :
+                'w-full max-w-[500px] aspect-square'
               }`}
             >
               <canvas
@@ -964,7 +964,7 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
         </div>
 
         {/* Right Column: Clip Inspector (3 cols) */}
-        <div className="col-span-12 md:col-span-3 border-l border-[#261d15] bg-[#120e0a] p-4 flex flex-col justify-between overflow-y-auto">
+        <div className="col-span-12 md:col-span-2 border-l border-[#261d15] bg-[#120e0a] p-4 flex flex-col justify-between overflow-y-auto">
           <div className="space-y-4">
             {/* Inspector Tabs */}
             <div className="flex items-center gap-1 border-b border-[#251b13] pb-2 text-xs">
