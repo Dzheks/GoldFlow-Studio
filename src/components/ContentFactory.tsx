@@ -751,34 +751,71 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
       const lines = cues.map((c) => c.text);
       const batches: string[][] = [];
       for (let i = 0; i < lines.length; i += CUSTOM_BATCH_SIZE) batches.push(lines.slice(i, i + CUSTOM_BATCH_SIZE));
-      const allBlocks: GeneratedBlock[] = [];
-      let sharedHero: GeneratedHero | undefined;
-      let lineOffset = 0;
-      for (let b = 0; b < batches.length; b++) {
-        setScriptBatchProgress({ current: b + 1, total: batches.length });
-        const batchRes = await generateScriptReal({
-          mode: 'custom',
-          scriptLines: batches[b],
-          topicPrompt: customContextHint.trim() || undefined,
-          heroOverride: sharedHero?.name,
-          language: scriptLanguage,
-        });
-        if (batchRes.isSimulated || !batchRes.blocks?.length || !batchRes.heroMaster) {
-          if (allBlocks.length === 0) {
-            showToast(`❌ Не удалось разобрать текст на кадры (${batchRes.error || 'нет ответа'})`);
-            return;
+
+      // Same fan-out as the custom/upload script path: run batch 0 alone to
+      // get a shared hero name, then the rest in parallel (concurrency 4).
+      // This was still a serial for-await loop here — on a 5-batch Lumean
+      // script that's what turned into the ~936s ("Сегмент 5 из 5...936с")
+      // wait the user hit.
+      setScriptBatchProgress({ current: 1, total: batches.length });
+      const firstRes = await generateScriptReal({
+        mode: 'custom',
+        scriptLines: batches[0],
+        topicPrompt: customContextHint.trim() || undefined,
+        language: scriptLanguage,
+      });
+      if (firstRes.isSimulated || !firstRes.blocks?.length || !firstRes.heroMaster) {
+        showToast(`❌ Не удалось разобрать текст на кадры (${firstRes.error || 'нет ответа'})`);
+        return;
+      }
+      const sharedHero: GeneratedHero = firstRes.heroMaster;
+      const perBatchBlocks: (GeneratedBlock[] | undefined)[] = new Array(batches.length);
+      perBatchBlocks[0] = firstRes.blocks;
+
+      if (batches.length > 1) {
+        let completed = 1;
+        const queue = Array.from({ length: batches.length - 1 }, (_, i) => i + 1);
+        const CONCURRENCY = Math.min(4, queue.length);
+        const runners = Array.from({ length: CONCURRENCY }, async () => {
+          while (queue.length > 0) {
+            const idx = queue.shift();
+            if (idx === undefined) return;
+            const r = await generateScriptReal({
+              mode: 'custom',
+              scriptLines: batches[idx],
+              topicPrompt: customContextHint.trim() || undefined,
+              heroOverride: sharedHero.name,
+              language: scriptLanguage,
+            });
+            if (!r.isSimulated && r.blocks?.length) perBatchBlocks[idx] = r.blocks;
+            completed++;
+            setScriptBatchProgress({ current: completed, total: batches.length });
           }
-          showToast(`⚠️ Собрано частично: ${allBlocks.length} блоков, дальше остановилось. Уже готовое не потеряно.`);
-          break;
-        }
-        if (!sharedHero) sharedHero = batchRes.heroMaster;
-        // Shift each block's 1-based indices into the global cue list.
-        batchRes.blocks.forEach((blk) => {
-          allBlocks.push({ ...blk, sourceLineIndices: (blk.sourceLineIndices || []).map((n) => n + lineOffset) });
         });
+        await Promise.all(runners);
+      }
+
+      // Reassemble in original batch order, shifting each block's
+      // sourceLineIndices into the global cue list — a batch that failed is
+      // silently dropped (partial result) rather than aborting everything.
+      const allBlocks: GeneratedBlock[] = [];
+      let lineOffset = 0;
+      let missingBatches = 0;
+      for (let b = 0; b < batches.length; b++) {
+        const blocks = perBatchBlocks[b];
+        if (blocks) {
+          blocks.forEach((blk) => {
+            allBlocks.push({ ...blk, sourceLineIndices: (blk.sourceLineIndices || []).map((n) => n + lineOffset) });
+          });
+        } else {
+          missingBatches++;
+        }
         lineOffset += batches[b].length;
       }
-      if (!sharedHero || allBlocks.length === 0) {
+      if (missingBatches > 0) {
+        showToast(`⚠️ ${missingBatches} из ${batches.length} сегментов не удалось разобрать — собрано частично, уже готовое не потеряно.`);
+      }
+      if (allBlocks.length === 0) {
         showToast('❌ Не удалось собрать блоки из озвучки');
         return;
       }
