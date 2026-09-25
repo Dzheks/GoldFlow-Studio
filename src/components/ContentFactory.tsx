@@ -4,7 +4,7 @@ import { ProjectData, StylePreset, CharacterItem, LocationItem, StoryScene } fro
 import { GENERATION_MODELS, getModelByCode } from '../config/models';
 import { ASPECT_RATIO_OPTIONS, getAspectRatioConfig, AspectRatioKey } from '../config/aspectRatios';
 import { generateSceneThumbnailDataUrl } from '../utils/proceduralCanvas';
-import { buildSynchronizedTimeline, estimateSpeechDuration, splitScriptIntoSentenceLines } from '../utils/autoAssembly';
+import { buildSynchronizedTimeline, estimateSpeechDuration, splitScriptIntoSentenceLines, splitScriptIntoParagraphGroups, groupParagraphsIntoBatches, splitScenesByDurationCap } from '../utils/autoAssembly';
 import { FlowImportModal } from './FlowImportModal';
 import { ParsedFlowFrame } from '../utils/flowResponseParser';
 import { NineFieldsEditorModal } from './NineFieldsEditorModal';
@@ -266,10 +266,13 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
       const CUSTOM_BATCH_SIZE = 20;
       const res = scriptTab === 'custom'
         ? await (async () => {
-            const batches: string[][] = [];
-            for (let i = 0; i < customScriptLines.length; i += CUSTOM_BATCH_SIZE) {
-              batches.push(customScriptLines.slice(i, i + CUSTOM_BATCH_SIZE));
-            }
+            // Batch by whole paragraphs, never mid-paragraph — the director
+            // AI needs a complete thought to genuinely decide frame count
+            // from content, not an arbitrary line-count slice.
+            const batches: string[][] = groupParagraphsIntoBatches(
+              splitScriptIntoParagraphGroups(customScriptText),
+              CUSTOM_BATCH_SIZE
+            );
             const allBlocks: GeneratedBlock[] = [];
             let sharedHero: GeneratedHero | undefined;
             for (let b = 0; b < batches.length; b++) {
@@ -395,8 +398,18 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
         showToast(`⚠️ Озвучка не удалась (${err?.message || 'ошибка'}) — тайминг остался оценочным.`);
       }
 
-      const { timelineClips, totalDuration } = buildSynchronizedTimeline(newScenes, selectedRatio, selectedStyleId);
-      onUpdateProject({ scriptText: fullScript, scenes: newScenes, timelineClips, duration: totalDuration, narrationAudioUrl, heroName: res.heroMaster.name });
+      // Content boundaries are decided above by the director AI — this is a
+      // separate pacing pass: nothing stays on screen longer than ~4-8s just
+      // because its scene ran long in the narration (see
+      // splitScenesByDurationCap for the exact N = floor(sec/4) rule).
+      const splitScenes = splitScenesByDurationCap(newScenes);
+      if (splitScenes.length !== newScenes.length) {
+        setPromptsText(splitScenes.map((s, i) => `${i + 1}. ${s.prompt}`).join('\n'));
+        showToast(`🎞️ Длинные сцены разбиты на кадры по ракурсам: ${newScenes.length} → ${splitScenes.length} кадров`);
+      }
+
+      const { timelineClips, totalDuration } = buildSynchronizedTimeline(splitScenes, selectedRatio, selectedStyleId);
+      onUpdateProject({ scriptText: fullScript, scenes: splitScenes, timelineClips, duration: totalDuration, narrationAudioUrl, heroName: res.heroMaster.name });
 
       // Generate the hero reference image now, once — every scene in
       // handleRunBatch reuses it for character consistency (п.04). It must

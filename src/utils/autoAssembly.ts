@@ -27,30 +27,115 @@ export function estimateSpeechDuration(text: string): number {
 }
 
 /**
- * Splits pasted narration text into one candidate frame per SENTENCE, not
- * per newline. A script pasted from a doc is usually one paragraph per
- * line — each paragraph holding a dozen sentences — so treating "line" as
- * "frame" undercounts badly (a ~11min/170-sentence script collapsed to
- * ~20 frames, one per paragraph, instead of one per ~3-4s beat). Splits on
+ * Splits pasted narration text into one candidate unit per SENTENCE, not
+ * per newline — a script pasted from a doc is usually one paragraph per
+ * line, each holding a dozen sentences, so treating "line" as "frame"
+ * undercounts badly. This does NOT decide how many video frames the script
+ * needs — that decision belongs to the director AI reading the whole text
+ * (server-side), which merges or splits these sentence units by actual
+ * content (new frame on a change of place/time/person, a long sentence that
+ * covers two visual beats becomes two frames, short connected sentences
+ * stay together). This function only produces the atomic, verbatim units
+ * the AI is allowed to regroup — never a duration estimate. Splits on
  * ./!/? followed by whitespace or end of paragraph; an ellipsis ("...") is
  * treated as a single delimiter, not three. Paragraph breaks (blank lines)
  * are preserved as hard boundaries between the sentence groups they contain.
  */
 export function splitScriptIntoSentenceLines(rawText: string): string[] {
+  return splitScriptIntoParagraphGroups(rawText).flat();
+}
+
+/**
+ * Same sentence-level split as splitScriptIntoSentenceLines, but keeps each
+ * paragraph's sentences as their own sub-array. Batching the AI's grouping
+ * calls by whole paragraphs (never cutting mid-paragraph) means every call
+ * sees a complete thought, not an arbitrary slice — the director AI decides
+ * frame count from real context, not from wherever a fixed line-count happened
+ * to land.
+ */
+export function splitScriptIntoParagraphGroups(rawText: string): string[][] {
   const paragraphs = rawText
     .split(/\n+/)
     .map((p) => p.trim())
     .filter(Boolean);
 
-  const lines: string[] = [];
-  for (const paragraph of paragraphs) {
+  return paragraphs.map((paragraph) => {
     const sentences = paragraph.match(/[^.!?]+(?:[.!?]+(?=\s|$)|$)/g) || [paragraph];
-    for (const s of sentences) {
-      const trimmed = s.trim();
-      if (trimmed) lines.push(trimmed);
+    return sentences.map((s) => s.trim()).filter(Boolean);
+  });
+}
+
+/**
+ * Packs whole paragraphs into batches capped at ~maxLinesPerBatch sentence
+ * lines, for the AI grouping calls that can only reliably handle so many
+ * detailed blocks per call. Never splits a paragraph across two batches —
+ * that would hand the director AI half a thought — except when a single
+ * paragraph alone exceeds the cap, which gets its own oversized batch rather
+ * than being silently truncated.
+ */
+export function groupParagraphsIntoBatches(paragraphGroups: string[][], maxLinesPerBatch: number): string[][] {
+  const batches: string[][] = [];
+  let current: string[] = [];
+  for (const paragraph of paragraphGroups) {
+    if (current.length > 0 && current.length + paragraph.length > maxLinesPerBatch) {
+      batches.push(current);
+      current = [];
+    }
+    current.push(...paragraph);
+  }
+  if (current.length > 0) batches.push(current);
+  return batches;
+}
+
+const CAMERA_ANGLE_VARIANTS = [
+  'wide establishing shot of this same moment',
+  'medium shot of this same moment, different framing',
+  'close-up detail shot of this same moment',
+  'low-angle shot of this same moment',
+  'over-the-shoulder shot of this same moment',
+  'high-angle shot of this same moment',
+];
+
+/**
+ * The director AI decides scene CONTENT boundaries (what belongs together
+ * by meaning) — but a single held image can't stay on screen for 9-12s of
+ * narration, so a scene that runs long still needs more than one camera
+ * angle. This is a pure pacing pass, applied AFTER content grouping: a
+ * scene over 4s gets split into N even sub-frames (N = floor(duration/4),
+ * so each half is never under 4s — 9s becomes 2×4.5s, 12s becomes 3×4s, but
+ * 6s stays one frame since splitting it would drop under the 4s floor).
+ * Every sub-frame keeps the exact same narration text and base prompt — the
+ * only thing that changes is an appended camera-angle instruction, so it
+ * reads as multiple shots of the same scene, not new content.
+ */
+export function splitScenesByDurationCap(scenes: StoryScene[]): StoryScene[] {
+  const MIN_FRAME_SECONDS = 4;
+  const result: StoryScene[] = [];
+  let nextId = 1;
+
+  for (const scene of scenes) {
+    const duration = scene.duration || estimateSpeechDuration(scene.description);
+    const n = Math.max(1, Math.floor(duration / MIN_FRAME_SECONDS));
+
+    if (n <= 1) {
+      result.push({ ...scene, id: nextId++ });
+      continue;
+    }
+
+    const perPartDuration = Math.round((duration / n) * 100) / 100;
+    for (let i = 0; i < n; i++) {
+      const angle = CAMERA_ANGLE_VARIANTS[i % CAMERA_ANGLE_VARIANTS.length];
+      const id = nextId++;
+      result.push({
+        ...scene,
+        id,
+        title: `План ${id}: ${scene.description.slice(0, 24)}... (ракурс ${i + 1}/${n})`,
+        duration: perPartDuration,
+        prompt: `${scene.prompt}. Camera angle ${i + 1} of ${n} for this same moment: ${angle}.`,
+      });
     }
   }
-  return lines;
+  return result;
 }
 
 /**

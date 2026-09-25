@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import { ViewMode, ProjectData } from './types';
 import { INITIAL_PROJECT } from './data/mockData';
 import { saveProjectToDb, loadProjectFromDb } from './utils/projectStorage';
@@ -19,23 +19,28 @@ export default function App() {
   const [credits, setCredits] = useState<number>(10000); // 10 000 Pro balance
   const [isAccountOpen, setIsAccountOpen] = useState<boolean>(false);
   const [project, setProject] = useState<ProjectData>(INITIAL_PROJECT);
-  const isProjectLoadedRef = useRef(false);
+  // Real, render-gating state (not a ref) — ContentFactory and friends read
+  // project.customStyles/heroRefImage/etc. into their OWN useState only
+  // once, on mount. If they mounted before the async IndexedDB load
+  // resolved, they'd permanently capture the empty INITIAL_PROJECT values
+  // and never see the real saved data arrive a moment later — which looked
+  // exactly like "the style didn't save" even though it was sitting in the
+  // database the whole time. Not rendering any view until load finishes
+  // guarantees every child's first mount sees the real, already-loaded data.
+  const [isProjectLoaded, setIsProjectLoaded] = useState(false);
 
-  // Load whatever was last autosaved (real disk-backed IndexedDB, not just
-  // in-memory state) before letting any change trigger a save — otherwise
-  // the very first render's INITIAL_PROJECT would overwrite the saved data.
   useEffect(() => {
     loadProjectFromDb().then((loaded) => {
       if (loaded) setProject(loaded);
-      isProjectLoadedRef.current = true;
+      setIsProjectLoaded(true);
     });
   }, []);
 
   useEffect(() => {
-    if (!isProjectLoadedRef.current) return;
+    if (!isProjectLoaded) return;
     const timeout = setTimeout(() => saveProjectToDb(project), 400);
     return () => clearTimeout(timeout);
-  }, [project]);
+  }, [project, isProjectLoaded]);
 
   const handleUpdateProject = (updated: Partial<ProjectData>) => {
     setProject((prev) => ({ ...prev, ...updated }));
@@ -51,6 +56,14 @@ export default function App() {
   };
 
   const isStudioView = currentView === 'montage' || currentView === 'factory';
+
+  if (!isProjectLoaded) {
+    return (
+      <div className="min-h-screen bg-[#0d0a08] flex items-center justify-center">
+        <div className="w-6 h-6 rounded-full border-2 border-amber-500/30 border-t-amber-400 animate-spin" />
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-[#0d0a08] text-stone-200 flex flex-col font-sans">
