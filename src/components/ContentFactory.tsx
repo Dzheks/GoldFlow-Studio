@@ -318,22 +318,21 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
       const isLineDriven = scriptTab === 'custom' || scriptTab === 'upload';
       const res = isLineDriven
         ? await (async () => {
-            // Custom mode: batch by whole paragraphs, never mid-paragraph — the
-            // director AI needs a complete thought to genuinely decide frame
-            // count from content. Upload mode: the transcript is already a flat
-            // sentence list, so slice it by size.
-            const batches: string[][] = scriptTab === 'upload'
-              ? (() => {
-                  const out: string[][] = [];
+            // Pasted text ('custom') batches by whole paragraphs, never
+            // mid-paragraph — the director AI needs a complete thought to
+            // genuinely decide frame count from content, not an arbitrary
+            // line-count slice. A transcript ('upload') has no real
+            // paragraph structure to preserve, so it just batches the flat
+            // sentence list linesForRun already produced.
+            const batches: string[][] = scriptTab === 'custom'
+              ? groupParagraphsIntoBatches(splitScriptIntoParagraphGroups(customScriptText), CUSTOM_BATCH_SIZE)
+              : (() => {
+                  const flat: string[][] = [];
                   for (let i = 0; i < linesForRun.length; i += CUSTOM_BATCH_SIZE) {
-                    out.push(linesForRun.slice(i, i + CUSTOM_BATCH_SIZE));
+                    flat.push(linesForRun.slice(i, i + CUSTOM_BATCH_SIZE));
                   }
-                  return out;
-                })()
-              : groupParagraphsIntoBatches(
-                  splitScriptIntoParagraphGroups(customScriptText),
-                  CUSTOM_BATCH_SIZE
-                );
+                  return flat;
+                })();
             const allBlocks: GeneratedBlock[] = [];
             let sharedHero: GeneratedHero | undefined;
             for (let b = 0; b < batches.length; b++) {
@@ -501,8 +500,11 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
     fullScript: string,
     narrationAudioUrl: string | undefined,
   ) => {
-    // Canonical pacing pass (N = floor(sec/4), camera-angle variants) lives in
-    // splitScenesByDurationCap so every mode splits identically.
+    // splitScenesByDurationCap (autoAssembly.ts) owns the actual math: exact
+    // user spec is N = floor(sec/4), so a 6s scene stays whole (6/2=3 < 4)
+    // instead of getting cut into two sub-4s shots — round() here would
+    // violate that. Single source of truth for every script mode that calls
+    // finalizeAndCommit (custom text, uploaded voiceover, Lumean tab, etc).
     const expandedScenes = splitScenesByDurationCap(scenesWithDurations);
 
     const expandedPromptsText = expandedScenes.map((s, i) => `${i + 1}. ${s.prompt}`).join('\n');
