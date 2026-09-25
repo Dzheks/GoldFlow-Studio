@@ -91,6 +91,10 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
   // now emits when there's a real mp3 drives play/pause/seek.
   const narrationAudioRef = useRef<HTMLAudioElement | null>(null);
   const narrationClip = clips.find((c) => c.trackId === 'voice' && !!c.audioUrl);
+  const [narrationVolume, setNarrationVolume] = useState<number>(1);
+  const [showSubtitles, setShowSubtitles] = useState<boolean>(true);
+  const [showInFrameCaption, setShowInFrameCaption] = useState<boolean>(false);
+  const [previewLinkCopied, setPreviewLinkCopied] = useState<boolean>(false);
 
   // Recalculate duration from clips
   useEffect(() => {
@@ -144,6 +148,11 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
   useEffect(() => {
     if (narrationAudioRef.current) narrationAudioRef.current.muted = isMuted;
   }, [isMuted]);
+
+  // Live-set narration playback volume so the Voice tab slider does something.
+  useEffect(() => {
+    if (narrationAudioRef.current) narrationAudioRef.current.volume = narrationVolume;
+  }, [narrationVolume]);
 
   // Animation playback loop
   useEffect(() => {
@@ -202,6 +211,13 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
 
     const activeScene = project.scenes.find(s => s.id === sceneIndex);
 
+    // Subtitles: prefer per-cue text on the voice track when it's there, else
+    // fall back to the current scene's own line — either way, only render when
+    // the user has titles turned on in the sidebar (was force-on before).
+    const subtitleText = showSubtitles
+      ? (activeVoice?.text || activeScene?.description || undefined)
+      : undefined;
+
     drawProceduralScene(ctx, canvas.width, canvas.height, {
       sceneId: sceneIndex,
       title: activeVideo?.name || 'Безымянный кадр',
@@ -210,12 +226,16 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
       motionType: activeVideo?.motion || 'zoom-in',
       transitionProgress: autoTransitions ? transProgress * 0.75 : 0,
       aspectRatio,
-      activeSubtitle: activeVoice?.text,
+      activeSubtitle: subtitleText,
       stickerOverlay: activeTitle?.text,
       imageUrl: activeVideo?.imageUrl || activeScene?.generatedImageUrl,
-      inFrameCaption: ELEVEN_LANGUAGES.find(l => l.id === selectedLanguageId)?.sampleCaption || '1984 год. Ницца, Франция',
+      // The little decorative badge (a date/place caption) is now opt-in — used
+      // to always show a sample "1984 год, Ницца, Франция" even for other stories.
+      inFrameCaption: showInFrameCaption
+        ? (ELEVEN_LANGUAGES.find(l => l.id === selectedLanguageId)?.sampleCaption || undefined)
+        : undefined,
     });
-  }, [currentTime, clips, autoTransitions, transitionDuration, aspectRatio, project.scenes, selectedLanguageId]);
+  }, [currentTime, clips, autoTransitions, transitionDuration, aspectRatio, project.scenes, selectedLanguageId, showSubtitles, showInFrameCaption]);
 
   // Keyboard shortcuts (Space = play, S = split, arrows = scrub)
   useEffect(() => {
@@ -505,8 +525,8 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
       {/* Main Workspace: 3-column layout (Left Tabs & Controls, Center Canvas Player, Right Inspector) */}
       <div className="flex-1 grid grid-cols-12 gap-0 overflow-hidden min-h-[460px]">
         {/* Left Column: Project assembly tabs & controls (3 cols) */}
-        <div className="col-span-12 md:col-span-3 border-r border-[#261d15] bg-[#120e0a] p-4 flex flex-col justify-between overflow-y-auto">
-          <div className="space-y-4">
+        <div className="col-span-12 md:col-span-3 border-r border-[#261d15] bg-[#120e0a] p-4 flex flex-col overflow-y-auto max-h-[calc(100vh-120px)]">
+          <div className="space-y-3">
             {/* Tabs */}
             <div className="flex items-center gap-1 border-b border-[#251b13] pb-2 text-xs">
               {(['project', 'voice', 'titles', 'sound', 'files'] as const).map((tab) => (
@@ -528,21 +548,26 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
               ))}
             </div>
 
-            {/* Selected project pill & actions */}
+            {/* Header pill — same on every tab so you always see project + close */}
             <div className="space-y-2">
               <div className="flex items-center justify-between p-2 rounded-lg bg-[#1a140e] border border-[#2b2014] text-xs">
                 <span className="font-semibold text-white truncate">
-                  {project.name} · 0 видео, {clips.filter(c => c.trackId === 'video').length} фото
+                  {project.name} · {clips.filter(c => c.trackId === 'video').length} кадров
                 </span>
                 <ChevronDown className="w-3.5 h-3.5 text-stone-400" />
               </div>
-
               <div className="flex items-center gap-2 text-xs">
                 <button
-                  onClick={() => alert('Ссылка на просмотр скопирована!')}
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(window.location.href);
+                      setPreviewLinkCopied(true);
+                      setTimeout(() => setPreviewLinkCopied(false), 1500);
+                    } catch { alert('Не удалось скопировать ссылку — скопируй из адресной строки.'); }
+                  }}
                   className="flex-1 py-1 rounded bg-[#1c150e] hover:bg-[#281f15] border border-[#332517] text-stone-300 text-center"
                 >
-                  Ссылка на просмотр
+                  {previewLinkCopied ? '✓ Скопировано' : 'Ссылка на просмотр'}
                 </button>
                 <button
                   onClick={onBack}
@@ -551,180 +576,219 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
                   Закрыть
                 </button>
               </div>
-
-              <p className="text-[11px] text-stone-500">
-                0 роликов, {clips.filter(c => c.trackId === 'video').length} кадров. Разложатся по номерам сцен.
-              </p>
             </div>
 
-            {/* Action Buttons */}
-            <div className="space-y-2 pt-1">
-              <button
-                onClick={handleGoldflowAutoSync}
-                className="w-full py-2.5 rounded-xl bg-gradient-to-r from-amber-500 via-amber-400 to-yellow-300 hover:from-amber-400 hover:to-yellow-200 text-black font-extrabold text-xs transition-all shadow-lg flex items-center justify-center gap-2 group"
-              >
-                <Wand2 className="w-4 h-4 text-black group-hover:rotate-12 transition-transform" />
-                <span>Автосборка под озвучку</span>
-              </button>
+            {/* ─── Tab: Проект — монтажные кнопки и общие числовые настройки ─── */}
+            {activeTab === 'project' && (
+              <>
+                <div className="space-y-2 pt-1">
+                  <button
+                    onClick={handleGoldflowAutoSync}
+                    className="w-full py-2.5 rounded-xl bg-gradient-to-r from-amber-500 via-amber-400 to-yellow-300 hover:from-amber-400 hover:to-yellow-200 text-black font-extrabold text-xs transition-all shadow-lg flex items-center justify-center gap-2 group"
+                  >
+                    <Wand2 className="w-4 h-4 text-black group-hover:rotate-12 transition-transform" />
+                    <span>Автосборка под озвучку</span>
+                  </button>
+                  <button
+                    onClick={handleExportVideo}
+                    disabled={isExporting}
+                    className="w-full py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-black font-extrabold text-xs transition-all shadow-lg flex items-center justify-center gap-2 disabled:opacity-50"
+                  >
+                    {isExporting ? (
+                      <>
+                        <div className="w-3.5 h-3.5 border-2 border-black border-t-transparent rounded-full animate-spin" />
+                        <span>Рендеринг {exportProgress}%...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Download className="w-4 h-4 fill-black" />
+                        <span>Смонтировать и скачать MP4</span>
+                      </>
+                    )}
+                  </button>
+                  {isExporting && exportStatusText && (
+                    <div className="p-2 rounded bg-black/50 border border-amber-500/30 text-[10px] font-mono text-amber-300 text-center animate-pulse">
+                      {exportStatusText}
+                    </div>
+                  )}
+                  <button
+                    onClick={handleShuffleLayout}
+                    className="w-full py-1.5 rounded-lg bg-[#1a130d] hover:bg-[#251b13] border border-[#382a1b] text-xs text-stone-400 hover:text-stone-200 transition-colors flex items-center justify-center gap-1.5"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>Перемешать порядок кадров</span>
+                  </button>
+                </div>
+                <div className="space-y-2 pt-2 border-t border-[#231a12] text-xs">
+                  <label className="flex items-center gap-2 cursor-pointer text-stone-300">
+                    <input type="checkbox" checked={autoTransitions} onChange={(e) => setAutoTransitions(e.target.checked)} className="rounded border-[#382b1c] text-amber-500 focus:ring-0" />
+                    <span>Переходы между сценами</span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer text-stone-300">
+                    <input type="checkbox" checked={syncWithVoice} onChange={(e) => setSyncWithVoice(e.target.checked)} className="rounded border-[#382b1c] text-amber-500 focus:ring-0" />
+                    <span>Подогнать под озвучку</span>
+                  </label>
+                </div>
+                <div className="space-y-2.5 pt-2 border-t border-[#231a12] text-xs">
+                  <div className="flex items-center justify-between">
+                    <span className="text-stone-400">Кадр держится, сек</span>
+                    <input type="number" step="0.5" min="1" max="12" value={clipHoldDuration} onChange={(e) => setClipHoldDuration(Number(e.target.value))} className="w-16 bg-[#18120d] border border-[#302216] rounded px-2 py-1 text-center font-mono text-white text-xs" />
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-stone-400">Длина перехода, сек</span>
+                    <input type="number" step="0.1" min="0.1" max="2" value={transitionDuration} onChange={(e) => setTransitionDuration(Number(e.target.value))} className="w-16 bg-[#18120d] border border-[#302216] rounded px-2 py-1 text-center font-mono text-white text-xs" />
+                  </div>
+                </div>
+                <p className="pt-3 border-t border-[#231a12] text-[10px] text-stone-500 leading-normal">
+                  Раскладка повторима: тот же порядок даёт тот же монтаж — понравился, просто пересобери.
+                </p>
+              </>
+            )}
 
-              {/* In-Frame Language Selector */}
-              <div className="pt-1">
-                <label className="text-[10px] text-stone-400 font-mono block mb-1">
-                  Язык надписей в кадре:
-                </label>
-                <select
-                  value={selectedLanguageId}
-                  onChange={(e) => setSelectedLanguageId(e.target.value)}
-                  className="w-full bg-[#16100b] border border-[#2e2116] rounded-lg px-2 py-1 text-xs text-stone-200 font-mono focus:outline-none focus:border-amber-500"
-                >
-                  {ELEVEN_LANGUAGES.map((l) => (
-                    <option key={l.id} value={l.id} className="bg-[#120e0a]">
-                      {l.name} ({l.nativeName}) · «{l.sampleCaption}»
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <button
-                onClick={handleExportVideo}
-                disabled={isExporting}
-                className="w-full py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-black font-extrabold text-xs transition-all shadow-lg flex items-center justify-center gap-2 disabled:opacity-50"
-              >
-                {isExporting ? (
+            {/* ─── Tab: Голос — real narration audio controls ─── */}
+            {activeTab === 'voice' && (
+              <div className="space-y-3 pt-1 text-xs">
+                {narrationClip?.audioUrl ? (
                   <>
-                    <div className="w-3.5 h-3.5 border-2 border-black border-t-transparent rounded-full animate-spin" />
-                    <span>Рендеринг {exportProgress}%...</span>
+                    <div className="p-3 rounded-xl bg-[#150f0b] border border-emerald-500/25 space-y-2">
+                      <p className="text-[11px] text-emerald-300 font-mono flex items-center gap-2"><Mic className="w-3 h-3" /> Реальная озвучка подключена</p>
+                      <audio controls src={narrationClip.audioUrl} className="w-full" style={{ height: 32 }} />
+                      <a href={narrationClip.audioUrl} download="narration.mp3" className="text-[11px] text-amber-300 hover:text-amber-200 underline block">Скачать mp3</a>
+                    </div>
+                    <div className="space-y-1">
+                      <span className="flex items-center justify-between text-[11px] text-stone-300 font-mono">
+                        <span>Громкость озвучки</span>
+                        <span className="text-stone-500">{Math.round(narrationVolume * 100)}%</span>
+                      </span>
+                      <input type="range" min={0} max={1} step={0.05} value={narrationVolume} onChange={(e) => setNarrationVolume(Number(e.target.value))} className="w-full accent-amber-500" />
+                    </div>
+                    <label className="flex items-center gap-2 cursor-pointer text-stone-300">
+                      <input type="checkbox" checked={isMuted} onChange={(e) => setIsMuted(e.target.checked)} className="rounded border-[#382b1c] text-amber-500 focus:ring-0" />
+                      <span>Заглушить весь звук на превью</span>
+                    </label>
+                    <p className="text-[10px] text-stone-500 leading-normal border-t border-[#231a12] pt-2">
+                      Реальный mp3 играет в лок-степе с плейхедом: play/пауза/прокрутка ведут именно эту дорожку, а не браузерную читалку.
+                    </p>
                   </>
                 ) : (
-                  <>
-                    <Download className="w-4 h-4 fill-black" />
-                    <span>Смонтировать и скачать MP4</span>
-                  </>
+                  <p className="text-[11px] text-stone-500 leading-normal">
+                    Реальная озвучка не подключена. Собери сценарий с озвучкой в «Контент-заводе» (вкладки «Придумать», «У меня свой текст», «Загрузить свою озвучку» или «Озвучить текст (Lumean)») — она сама подтянется сюда.
+                  </p>
                 )}
-              </button>
-
-              {isExporting && exportStatusText && (
-                <div className="p-2 rounded bg-black/50 border border-amber-500/30 text-[10px] font-mono text-amber-300 text-center animate-pulse">
-                  {exportStatusText}
-                </div>
-              )}
-              
-              <button
-                onClick={handleShuffleLayout}
-                className="w-full py-1.5 rounded-lg bg-[#1a130d] hover:bg-[#251b13] border border-[#382a1b] text-xs text-stone-400 hover:text-stone-200 transition-colors"
-              >
-                Перемешать сид порядка
-              </button>
-            </div>
-
-            {/* Checkbox Options */}
-            <div className="space-y-2 pt-2 border-t border-[#231a12] text-xs">
-              <label className="flex items-center gap-2 cursor-pointer text-stone-300">
-                <input
-                  type="checkbox"
-                  checked={autoTransitions}
-                  onChange={(e) => setAutoTransitions(e.target.checked)}
-                  className="rounded border-[#382b1c] text-amber-500 focus:ring-0"
-                />
-                <span>Переходы между сценами</span>
-              </label>
-
-              <label className="flex items-center gap-2 cursor-pointer text-stone-300">
-                <input
-                  type="checkbox"
-                  checked={syncWithVoice}
-                  onChange={(e) => setSyncWithVoice(e.target.checked)}
-                  className="rounded border-[#382b1c] text-amber-500 focus:ring-0"
-                />
-                <span>Подогнать под озвучку</span>
-              </label>
-
-              <label className="flex items-center gap-2 cursor-pointer text-stone-400">
-                <input
-                  type="checkbox"
-                  checked={removePauses}
-                  onChange={(e) => setRemovePauses(e.target.checked)}
-                  className="rounded border-[#382b1c] text-amber-500 focus:ring-0"
-                />
-                <span>Вырезать паузы (вертикальные)</span>
-              </label>
-
-              <label className="flex items-center gap-2 cursor-pointer text-stone-400">
-                <input
-                  type="checkbox"
-                  checked={speedUpPlans}
-                  onChange={(e) => setSpeedUpPlans(e.target.checked)}
-                  className="rounded border-[#382b1c] text-amber-500 focus:ring-0"
-                />
-                <span>Ускорять планы (вертикальные)</span>
-              </label>
-            </div>
-
-            {/* Numeric Sliders / Controls */}
-            <div className="space-y-2.5 pt-2 border-t border-[#231a12] text-xs">
-              <div className="flex items-center justify-between">
-                <span className="text-stone-400">Кадр держится, сек</span>
-                <input
-                  type="number"
-                  step="0.5"
-                  min="1"
-                  max="12"
-                  value={clipHoldDuration}
-                  onChange={(e) => setClipHoldDuration(Number(e.target.value))}
-                  className="w-16 bg-[#18120d] border border-[#302216] rounded px-2 py-1 text-center font-mono text-white text-xs"
-                />
               </div>
+            )}
 
-              <div className="flex items-center justify-between">
-                <span className="text-stone-400">Звук роликов под голосом</span>
-                <input
-                  type="number"
-                  step="0.05"
-                  min="0"
-                  max="1"
-                  value={duckingLevel}
-                  onChange={(e) => {
+            {/* ─── Tab: Титры — real per-scene subtitle list ─── */}
+            {activeTab === 'titles' && (
+              <div className="space-y-3 pt-1 text-xs">
+                <label className="flex items-center gap-2 cursor-pointer text-stone-300">
+                  <input type="checkbox" checked={showSubtitles} onChange={(e) => setShowSubtitles(e.target.checked)} className="rounded border-[#382b1c] text-amber-500 focus:ring-0" />
+                  <span>Показывать субтитры на превью</span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer text-stone-300">
+                  <input type="checkbox" checked={showInFrameCaption} onChange={(e) => setShowInFrameCaption(e.target.checked)} className="rounded border-[#382b1c] text-amber-500 focus:ring-0" />
+                  <span>Показывать плашку места/года</span>
+                </label>
+                {showInFrameCaption && (
+                  <div className="space-y-1">
+                    <label className="text-[10px] text-stone-400 font-mono block">Язык плашки:</label>
+                    <select value={selectedLanguageId} onChange={(e) => setSelectedLanguageId(e.target.value)} className="w-full bg-[#16100b] border border-[#2e2116] rounded-lg px-2 py-1 text-xs text-stone-200 font-mono focus:outline-none focus:border-amber-500">
+                      {ELEVEN_LANGUAGES.map((l) => (
+                        <option key={l.id} value={l.id} className="bg-[#120e0a]">{l.name} · «{l.sampleCaption}»</option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+                <div className="space-y-1 pt-2 border-t border-[#231a12]">
+                  <p className="text-[11px] text-stone-400 font-mono">Строки по сценам ({project.scenes.length}):</p>
+                  <div className="space-y-1 max-h-[300px] overflow-y-auto pr-1">
+                    {project.scenes.map((s, idx) => {
+                      const videoClip = clips.find(c => c.trackId === 'video' && c.name.startsWith(`${idx + 1 < 10 ? '0' : ''}${idx + 1}.`));
+                      const startAt = videoClip?.startTime ?? 0;
+                      return (
+                        <button
+                          key={s.id}
+                          onClick={() => setCurrentTime(startAt)}
+                          className="w-full text-left p-2 rounded bg-[#150f0b] border border-[#231a12] hover:border-amber-500/40 transition-colors"
+                          title="Перейти к этому моменту"
+                        >
+                          <p className="text-[10px] text-amber-400 font-mono">#{s.id} · {startAt.toFixed(1)}с</p>
+                          <p className="text-[11px] text-stone-300 leading-snug line-clamp-2">{s.description || s.title}</p>
+                        </button>
+                      );
+                    })}
+                    {project.scenes.length === 0 && <p className="text-[11px] text-stone-500">Сцен пока нет.</p>}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* ─── Tab: Звук — фоновая музыка / ducking ─── */}
+            {activeTab === 'sound' && (
+              <div className="space-y-3 pt-1 text-xs">
+                <div className="p-3 rounded-xl bg-[#150f0b] border border-[#2b2116] space-y-2">
+                  <p className="text-[11px] text-stone-300 font-mono flex items-center gap-2"><Music className="w-3 h-3 text-emerald-400" /> Фоновая музыка</p>
+                  <p className="text-[10px] text-stone-500">Синтезированный ambient играет фоном на превью и в экспорт-рендере.</p>
+                </div>
+                <div className="space-y-1">
+                  <span className="flex items-center justify-between text-[11px] text-stone-300 font-mono">
+                    <span>Громкость музыки под голосом</span>
+                    <span className="text-stone-500">{Math.round(duckingLevel * 100)}%</span>
+                  </span>
+                  <input type="range" min={0} max={1} step={0.05} value={duckingLevel} onChange={(e) => {
                     const val = Number(e.target.value);
                     setDuckingLevel(val);
                     soundEngine.setMusicVolume(val);
-                  }}
-                  className="w-16 bg-[#18120d] border border-[#302216] rounded px-2 py-1 text-center font-mono text-white text-xs"
-                />
+                  }} className="w-full accent-amber-500" />
+                </div>
+                <p className="text-[10px] text-stone-500 leading-normal border-t border-[#231a12] pt-2">
+                  Меньше — музыка тише при озвучке (речь пробивается); больше — музыка ровно, речь на её фоне.
+                </p>
               </div>
+            )}
 
-              <div className="flex items-center justify-between">
-                <span className="text-stone-400">Длина перехода, сек</span>
-                <input
-                  type="number"
-                  step="0.1"
-                  min="0.1"
-                  max="2"
-                  value={transitionDuration}
-                  onChange={(e) => setTransitionDuration(Number(e.target.value))}
-                  className="w-16 bg-[#18120d] border border-[#302216] rounded px-2 py-1 text-center font-mono text-white text-xs"
-                />
+            {/* ─── Tab: Файлы — real project assets ─── */}
+            {activeTab === 'files' && (
+              <div className="space-y-2 pt-1 text-xs">
+                {narrationClip?.audioUrl && (
+                  <div className="flex items-center justify-between gap-2 p-2 rounded bg-[#150f0b] border border-[#231a12]">
+                    <span className="truncate text-stone-300 flex items-center gap-1.5"><Mic className="w-3 h-3 text-sky-400 shrink-0" /> narration.mp3</span>
+                    <a href={narrationClip.audioUrl} download="narration.mp3" className="text-[10px] text-amber-300 hover:text-amber-200 underline shrink-0">Скачать</a>
+                  </div>
+                )}
+                {project.heroRefImage && (
+                  <div className="flex items-center justify-between gap-2 p-2 rounded bg-[#150f0b] border border-[#231a12]">
+                    <span className="truncate text-stone-300 flex items-center gap-1.5"><ImageIcon className="w-3 h-3 text-amber-400 shrink-0" /> hero_{project.heroName || 'reference'}.png</span>
+                    <a href={`data:${project.heroRefImage.mimeType};base64,${project.heroRefImage.base64}`} download={`hero_${project.heroName || 'reference'}.png`} className="text-[10px] text-amber-300 hover:text-amber-200 underline shrink-0">Скачать</a>
+                  </div>
+                )}
+                <div className="p-2 rounded bg-[#150f0b] border border-[#231a12]">
+                  <p className="text-stone-300 flex items-center gap-1.5"><ImageIcon className="w-3 h-3 text-amber-400" /> Кадры проекта: {project.scenes.filter(s => s.generatedImageUrl).length} из {project.scenes.length}</p>
+                  <p className="text-[10px] text-stone-500 mt-0.5">Скачать одним архивом — в «Контент-заводе», кнопка «Скачать архивом».</p>
+                </div>
+                {project.scriptText && (
+                  <div className="p-2 rounded bg-[#150f0b] border border-[#231a12] space-y-1">
+                    <p className="text-stone-300 flex items-center gap-1.5"><Type className="w-3 h-3 text-emerald-400" /> Сценарий (текст)</p>
+                    <button
+                      onClick={() => {
+                        const blob = new Blob([project.scriptText], { type: 'text/plain;charset=utf-8' });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a'); a.href = url; a.download = `${project.name || 'script'}.txt`; a.click(); URL.revokeObjectURL(url);
+                      }}
+                      className="text-[10px] text-amber-300 hover:text-amber-200 underline"
+                    >Скачать .txt</button>
+                  </div>
+                )}
+                {project.customStyles.length > 0 && (
+                  <div className="p-2 rounded bg-[#150f0b] border border-[#231a12]">
+                    <p className="text-stone-300 flex items-center gap-1.5"><Layers className="w-3 h-3 text-amber-400" /> Кастомных стилей: {project.customStyles.length}</p>
+                  </div>
+                )}
+                {!narrationClip?.audioUrl && !project.heroRefImage && project.scenes.length === 0 && (
+                  <p className="text-[11px] text-stone-500">Файлов проекта пока нет. Собери сценарий и кадры в «Контент-заводе».</p>
+                )}
               </div>
-
-              <button
-                onClick={handleShuffleLayout}
-                className="w-full py-1.5 rounded bg-[#1c150e] hover:bg-[#281f15] border border-[#332517] text-stone-300 text-xs transition-colors flex items-center justify-center gap-1.5"
-              >
-                <RotateCcw className="w-3.5 h-3.5" />
-                <span>Перемешать заново</span>
-              </button>
-            </div>
-          </div>
-
-          <div className="pt-4 border-t border-[#231a12] text-[10px] text-stone-500 leading-normal">
-            Раскладка повторима: один и тот же номер даёт один и тот же монтаж. Понравился результат — номер можно записать.
-            <div className="mt-2 flex items-center gap-3 text-[11px] text-amber-400/80 font-mono">
-              <button onClick={() => alert('Настройка долей эффектов')} className="hover:underline">
-                ДОЛИ ЭФФЕКТОВ
-              </button>
-              <button onClick={() => alert('Расширенная конфигурация параметров')} className="hover:underline">
-                НАСТРОИТЬ
-              </button>
-            </div>
+            )}
           </div>
         </div>
 
