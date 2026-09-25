@@ -232,14 +232,32 @@ async function startServer() {
     return json.data;
   }
 
-  async function getOrCreateLumeanTemplate(voiceId: string, langCode: string): Promise<string> {
-    const cacheKey = `${voiceId}:${langCode}`;
+  interface VoiceSettingsInput {
+    stability?: number;
+    similarity_boost?: number;
+    use_speaker_boost?: boolean;
+    speed?: number;
+  }
+  async function getOrCreateLumeanTemplate(
+    voiceId: string,
+    langCode: string,
+    settings?: VoiceSettingsInput,
+  ): Promise<string> {
+    const s = {
+      stability: settings?.stability ?? 0.5,
+      similarity_boost: settings?.similarity_boost ?? 0.75,
+      use_speaker_boost: settings?.use_speaker_boost ?? true,
+      speed: settings?.speed ?? 1.0,
+    };
+    // Include settings in the cache key so different voice tunings don't share
+    // one template (which would silently reuse the first tuning's values).
+    const cacheKey = `${voiceId}:${langCode}:${s.stability}:${s.similarity_boost}:${s.use_speaker_boost ? 1 : 0}:${s.speed}`;
     if (lumeanTemplateCache.has(cacheKey)) return lumeanTemplateCache.get(cacheKey)!;
     const data = await lumeanFetch('/templates', {
       method: 'POST',
       body: JSON.stringify({
         service_key: 'elevenlabs',
-        name: `goldflow_${cacheKey}_${Date.now()}`,
+        name: `goldflow_${voiceId}_${langCode}_${Date.now()}`,
         config: {
           tts_settings: {
             mode: 'mode_v1',
@@ -247,13 +265,36 @@ async function startServer() {
             voice_id: voiceId,
             language_code: langCode,
             advanced_voice_settings: true,
-            voice_settings: { stability: 0.5, similarity_boost: 0.75, use_speaker_boost: true, speed: 1.0 },
+            voice_settings: s,
           },
         },
       }),
     });
     lumeanTemplateCache.set(cacheKey, data.id);
     return data.id;
+  }
+
+  // Server-side cache of the ElevenLabs voice library so we don't hit the API
+  // on every panel open. 5-minute TTL is plenty for the "browse voices" UI.
+  let voiceLibraryCache: { at: number; voices: any[] } | null = null;
+  async function fetchVoiceLibrary(): Promise<any[]> {
+    if (voiceLibraryCache && Date.now() - voiceLibraryCache.at < 5 * 60 * 1000) {
+      return voiceLibraryCache.voices;
+    }
+    const all: any[] = [];
+    // Pull a few pages so search covers the whole library the account has.
+    for (let page = 0; page < 5; page++) {
+      try {
+        const data = await lumeanFetch(`/voices/elevenlabs/library?page=${page}&page_size=100`);
+        const voices = data?.voices || [];
+        all.push(...voices);
+        if (voices.length < 100) break;
+      } catch {
+        break;
+      }
+    }
+    voiceLibraryCache = { at: Date.now(), voices: all };
+    return all;
   }
 
   function parseSrt(srtText: string): { index: number; startSec: number; endSec: number; text: string }[] {
@@ -308,9 +349,67 @@ async function startServer() {
     }
   }
 
+  // Voice library browser + search. Server-side so the Lumean API key never
+  // touches the client. Optional ?q= narrows by substring on name/accent/desc.
+  app.get('/api/lumean/voices', async (req, res) => {
+    try {
+      if (!lumeanApiKey) return res.status(503).json({ error: 'LUMEAN_API_KEY не настроен в окружении' });
+      const q = String(req.query.q || '').trim().toLowerCase();
+      const voices = await fetchVoiceLibrary();
+      const mapped = voices.map((v: any) => ({
+        id: v.voice_id || v.id,
+        name: v.name || v.display_name || '',
+        category: v.category || '',
+        gender: v.labels?.gender || v.gender || '',
+        accent: v.labels?.accent || v.accent || '',
+        age: v.labels?.age || '',
+        description: v.description || v.labels?.description || v.use_case || '',
+        previewUrl: v.preview_url || '',
+        languages: (v.verified_languages || []).map((l: any) => l.language || l),
+      }));
+      const filtered = q
+        ? mapped.filter((v: any) => (
+            v.id.toLowerCase().includes(q)
+            || v.name.toLowerCase().includes(q)
+            || v.accent.toLowerCase().includes(q)
+            || v.description.toLowerCase().includes(q)
+            || v.gender.toLowerCase().includes(q)
+          ))
+        : mapped;
+      res.json({ voices: filtered, total: mapped.length });
+    } catch (err: any) {
+      console.error('lumean/voices error:', err);
+      res.status(500).json({ error: err?.message || 'Voices fetch failed' });
+    }
+  });
+
+  // Single-voice lookup by ID (for pasted voice IDs). Hits the shared voice
+  // (`/voices/elevenlabs/shared/:id`) endpoint when the library doesn't hold it.
+  app.get('/api/lumean/voice/:id', async (req, res) => {
+    try {
+      if (!lumeanApiKey) return res.status(503).json({ error: 'LUMEAN_API_KEY не настроен в окружении' });
+      const id = String(req.params.id || '').trim();
+      if (!id) return res.status(400).json({ error: 'Пустой voice_id' });
+      const library = await fetchVoiceLibrary();
+      const found = library.find((v: any) => (v.voice_id || v.id) === id);
+      if (found) return res.json({ voice: found });
+      // Not in cached library — try the direct shared-voice lookup so pasted
+      // "hidden" voice IDs still resolve.
+      try {
+        const data = await lumeanFetch(`/voices/elevenlabs/shared/${encodeURIComponent(id)}`);
+        return res.json({ voice: data });
+      } catch (inner: any) {
+        return res.status(404).json({ error: inner?.message || 'Голос не найден' });
+      }
+    } catch (err: any) {
+      console.error('lumean/voice/:id error:', err);
+      res.status(500).json({ error: err?.message || 'Voice lookup failed' });
+    }
+  });
+
   app.post('/api/synthesize-voice', async (req, res) => {
     try {
-      const { text, voiceId, langCode } = req.body || {};
+      const { text, voiceId, langCode, voiceSettings } = req.body || {};
       if (!lumeanApiKey) {
         return res.status(503).json({ error: 'LUMEAN_API_KEY не настроен в окружении' });
       }
@@ -318,7 +417,7 @@ async function startServer() {
         return res.status(400).json({ error: 'Пустой текст для озвучки' });
       }
 
-      const templateId = await getOrCreateLumeanTemplate(voiceId || '21m00Tcm4TlvDq8ikWAM', langCode || 'ru');
+      const templateId = await getOrCreateLumeanTemplate(voiceId || '21m00Tcm4TlvDq8ikWAM', langCode || 'ru', voiceSettings);
       const order = await lumeanFetch('/orders', {
         method: 'POST',
         body: JSON.stringify({ template_id: templateId, input_text: text }),

@@ -135,10 +135,30 @@ export interface SynthesizeVoiceResult {
   error?: string;
 }
 
+export interface VoiceLibraryEntry {
+  id: string;
+  name: string;
+  category?: string;
+  gender?: string;
+  accent?: string;
+  age?: string;
+  description?: string;
+  previewUrl?: string;
+  languages?: string[];
+}
+
+export interface LumeanVoiceSettings {
+  stability?: number;
+  similarity_boost?: number;
+  use_speaker_boost?: boolean;
+  speed?: number;
+}
+
 export async function synthesizeVoiceReal(payload: {
   text: string;
   voiceId?: string;
   langCode?: string;
+  voiceSettings?: LumeanVoiceSettings;
 }): Promise<SynthesizeVoiceResult> {
   try {
     const res = await fetch('/api/synthesize-voice', {
@@ -151,6 +171,41 @@ export async function synthesizeVoiceReal(payload: {
       return { error: data?.error || 'Ошибка озвучки' };
     }
     return data;
+  } catch (err: any) {
+    return { error: err?.message || 'Сервер недоступен' };
+  }
+}
+
+export async function fetchLumeanVoices(query?: string): Promise<{ voices: VoiceLibraryEntry[]; total: number; error?: string }> {
+  try {
+    const res = await fetch(`/api/lumean/voices${query ? `?q=${encodeURIComponent(query)}` : ''}`);
+    const data = await res.json();
+    if (!res.ok) return { voices: [], total: 0, error: data?.error || 'Ошибка загрузки голосов' };
+    return { voices: data.voices || [], total: data.total || 0 };
+  } catch (err: any) {
+    return { voices: [], total: 0, error: err?.message || 'Сервер недоступен' };
+  }
+}
+
+export async function fetchLumeanVoiceById(id: string): Promise<{ voice?: VoiceLibraryEntry; error?: string }> {
+  try {
+    const res = await fetch(`/api/lumean/voice/${encodeURIComponent(id)}`);
+    const data = await res.json();
+    if (!res.ok) return { error: data?.error || 'Голос не найден' };
+    const v: any = data.voice || {};
+    return {
+      voice: {
+        id: v.voice_id || v.id || id,
+        name: v.name || v.display_name || '',
+        category: v.category || '',
+        gender: v.labels?.gender || v.gender || '',
+        accent: v.labels?.accent || v.accent || '',
+        age: v.labels?.age || '',
+        description: v.description || v.use_case || '',
+        previewUrl: v.preview_url || '',
+        languages: (v.verified_languages || []).map((l: any) => l.language || l),
+      },
+    };
   } catch (err: any) {
     return { error: err?.message || 'Сервер недоступен' };
   }

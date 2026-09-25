@@ -9,6 +9,7 @@ import { FlowImportModal } from './FlowImportModal';
 import { ParsedFlowFrame } from '../utils/flowResponseParser';
 import { NineFieldsEditorModal } from './NineFieldsEditorModal';
 import { CreateStyleModal } from './CreateStyleModal';
+import { VoiceLibraryModal } from './VoiceLibraryModal';
 import { CharacterReferenceModal } from './CharacterReferenceModal';
 import { HeroMasterShowcase } from './HeroMasterShowcase';
 import { AutomatedPipelineRunner } from './AutomatedPipelineRunner';
@@ -123,6 +124,12 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
   const [lumeanText, setLumeanText] = useState<string>('');
   const [lumeanResult, setLumeanResult] = useState<import('../services/geminiPipelineClient').SynthesizeVoiceResult | null>(null);
   const [isSynthesizing, setIsSynthesizing] = useState<boolean>(false);
+  const [isVoiceLibraryOpen, setIsVoiceLibraryOpen] = useState<boolean>(false);
+  // Currently picked voice for the Lumean tab. Default is Rachel (21m00…) —
+  // same voice the server falls back to, so behavior is unchanged until pick.
+  const [pickedVoice, setPickedVoice] = useState<{
+    voiceId: string; voiceName: string; stability: number; similarityBoost: number; useSpeakerBoost: boolean; speed: number;
+  }>({ voiceId: '21m00Tcm4TlvDq8ikWAM', voiceName: 'Rachel (по умолчанию)', stability: 0.5, similarityBoost: 0.75, useSpeakerBoost: true, speed: 1.0 });
   const [targetSeconds, setTargetSeconds] = useState<number>(60);
   const [customMin, setCustomMin] = useState<number>(1);
   const [customSec, setCustomSec] = useState<number>(0);
@@ -596,8 +603,18 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
     setIsSynthesizing(true);
     setLumeanResult(null);
     try {
-      showToast('🎙️ Отправляю текст в Lumean на озвучку — это может занять до 2 минут…');
-      const voiceRes = await synthesizeVoiceReal({ text: lumeanText, langCode: scriptLanguage });
+      showToast(`🎙️ Отправляю в Lumean голосом «${pickedVoice.voiceName}» — до 2 мин…`);
+      const voiceRes = await synthesizeVoiceReal({
+        text: lumeanText,
+        langCode: scriptLanguage,
+        voiceId: pickedVoice.voiceId,
+        voiceSettings: {
+          stability: pickedVoice.stability,
+          similarity_boost: pickedVoice.similarityBoost,
+          use_speaker_boost: pickedVoice.useSpeakerBoost,
+          speed: pickedVoice.speed,
+        },
+      });
       if (voiceRes.error || !voiceRes.audioUrl) {
         showToast(`❌ Озвучка не удалась (${voiceRes.error || 'нет аудио'})`);
         return;
@@ -1591,6 +1608,22 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
               ) : (
                 <>
                   {/* Lumean mode: tagged text → real synth → pause-accurate timecodes → prompts */}
+                  <div className="flex items-center justify-between gap-3 p-3 rounded-xl bg-[#150f0b] border border-[#2b2116]">
+                    <div className="min-w-0">
+                      <p className="text-[10px] uppercase text-stone-500 font-mono">Голос</p>
+                      <p className="text-sm text-white font-semibold truncate">{pickedVoice.voiceName}</p>
+                      <p className="text-[10px] text-stone-500 font-mono truncate">
+                        {pickedVoice.voiceId} · stab {pickedVoice.stability.toFixed(2)} · sim {pickedVoice.similarityBoost.toFixed(2)} · speed {pickedVoice.speed.toFixed(2)}{pickedVoice.useSpeakerBoost ? ' · boost' : ''}
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => setIsVoiceLibraryOpen(true)}
+                      className="px-3 py-2 rounded-lg bg-[#22160f] hover:bg-[#321e15] text-amber-300 text-xs font-semibold border border-[#3a2318] shrink-0"
+                    >
+                      Выбрать голос
+                    </button>
+                  </div>
+
                   <textarea
                     value={lumeanText}
                     onChange={(e) => setLumeanText(e.target.value)}
@@ -2480,6 +2513,24 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
       />
 
       {/* Custom Style Creation Modal */}
+      <VoiceLibraryModal
+        isOpen={isVoiceLibraryOpen}
+        onClose={() => setIsVoiceLibraryOpen(false)}
+        langCode={scriptLanguage}
+        currentVoiceId={pickedVoice.voiceId}
+        onPick={(p) => {
+          setPickedVoice({
+            voiceId: p.voiceId,
+            voiceName: p.voiceName,
+            stability: p.stability,
+            similarityBoost: p.similarityBoost,
+            useSpeakerBoost: p.useSpeakerBoost,
+            speed: p.speed,
+          });
+          showToast(`🎙️ Голос выбран: ${p.voiceName}`);
+        }}
+      />
+
       <CreateStyleModal
         isOpen={isStyleModalOpen}
         onClose={() => {
