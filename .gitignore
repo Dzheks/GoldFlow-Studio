@@ -8,3 +8,5 @@ coverage/
 !.env.example
 .flow-profile/
 .flow-tunnel.json
+.tmp/
+.npm-cache/
