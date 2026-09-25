@@ -1546,6 +1546,31 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
                         onChange={(e) => {
                           const file = e.target.files?.[0];
                           if (!file) return;
+                          // Browsers don't strictly enforce `accept`, so an
+                          // .srt/.vtt can slip in here even though it's for the
+                          // OTHER dropzone below. Detect it and route to the
+                          // right place instead of showing a broken 0:00 player.
+                          const nameLc = file.name.toLowerCase();
+                          const isSubs = nameLc.endsWith('.srt') || nameLc.endsWith('.vtt');
+                          const isAudio = (file.type || '').startsWith('audio/');
+                          if (isSubs) {
+                            const reader = new FileReader();
+                            reader.onload = () => {
+                              const cues = parseSrtOrVttText(String(reader.result || ''));
+                              if (!cues.length) {
+                                showToast('❌ Файл субтитров не удалось разобрать — проверь формат.');
+                                return;
+                              }
+                              setUploadedSrt({ name: file.name, cues });
+                              showToast(`📄 Это оказались субтитры — положил их в поле для таймкодов (${cues.length} сегментов, ${Math.round(cues[cues.length - 1].endSec)} сек).`);
+                            };
+                            reader.readAsText(file);
+                            return;
+                          }
+                          if (!isAudio) {
+                            showToast(`❌ «${file.name}» не аудиофайл. Ожидаю mp3/wav/m4a; для .srt/.vtt — второе поле ниже.`);
+                            return;
+                          }
                           const reader = new FileReader();
                           reader.onload = () => {
                             const dataUrl = String(reader.result || '');
@@ -1586,6 +1611,28 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
                         onChange={(e) => {
                           const file = e.target.files?.[0];
                           if (!file) return;
+                          // Symmetric routing: an audio file dropped here goes
+                          // into the audio slot above instead of a silent fail.
+                          const nameLc = file.name.toLowerCase();
+                          const isSubs = nameLc.endsWith('.srt') || nameLc.endsWith('.vtt');
+                          const isAudio = (file.type || '').startsWith('audio/');
+                          if (isAudio && !isSubs) {
+                            const reader = new FileReader();
+                            reader.onload = () => {
+                              const dataUrl = String(reader.result || '');
+                              const base64 = dataUrl.replace(/^data:[^;]+;base64,/, '');
+                              if (uploadedAudio?.objectUrl) URL.revokeObjectURL(uploadedAudio.objectUrl);
+                              setUploadedAudio({
+                                base64,
+                                mimeType: file.type || 'audio/mpeg',
+                                name: file.name,
+                                objectUrl: URL.createObjectURL(file),
+                              });
+                              showToast(`🎧 Это оказалось аудио — положил в поле для озвучки: ${file.name}`);
+                            };
+                            reader.readAsDataURL(file);
+                            return;
+                          }
                           const reader = new FileReader();
                           reader.onload = () => {
                             const cues = parseSrtOrVttText(String(reader.result || ''));
