@@ -357,6 +357,13 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
         fps,
         bgMusicVolume: duckingLevel,
         languageId: selectedLanguageId,
+        // Pass the actual mp3 + preview toggles through so the exported file
+        // sounds and looks like the Montage preview did.
+        narrationAudioUrl: narrationClip?.audioUrl,
+        showSubtitles,
+        showInFrameCaption,
+        autoTransitions,
+        transitionDuration,
         onProgress: (percent, statusText) => {
           setExportProgress(percent);
           setExportStatusText(statusText);
@@ -1075,7 +1082,7 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
             {inspectorTab === 'style' && (
               <div className="space-y-3 text-xs">
                 <label className="block text-[11px] font-semibold text-stone-300">
-                  Добавить плашку на экран:
+                  Добавить плашку на экран (появится с текущего момента):
                 </label>
                 <div className="space-y-2">
                   {[
@@ -1093,15 +1100,55 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
                           startTime: currentTime,
                           duration: 3.5,
                           color: '#ef4444',
-                          text: presetText
+                          text: presetText,
                         };
                         setClips([...clips, newTitleClip]);
-                        alert('Плашка добавлена на дорожку титров!');
+                        setSelectedClipId(newTitleClip.id);
                       }}
                       className="w-full text-left p-2.5 rounded-lg bg-[#18120d] border border-[#2b2014] hover:border-amber-500/40 text-stone-300 text-[11px] transition-colors"
                     >
                       + {presetText}
                     </button>
+                  ))}
+                </div>
+                <CustomTitleInput
+                  onAdd={(text) => {
+                    const clip: TimelineClip = {
+                      id: `clip-t-${Date.now()}`,
+                      trackId: 'titles',
+                      name: text.slice(0, 20),
+                      startTime: currentTime,
+                      duration: 3.5,
+                      color: '#ef4444',
+                      text,
+                    };
+                    setClips([...clips, clip]);
+                    setSelectedClipId(clip.id);
+                  }}
+                />
+                <div className="pt-2 border-t border-[#231a12] space-y-1">
+                  <p className="text-[11px] text-stone-400 font-mono">На таймлайне сейчас ({clips.filter(c => c.trackId === 'titles').length}):</p>
+                  {clips.filter(c => c.trackId === 'titles').length === 0 && (
+                    <p className="text-[11px] text-stone-500">Пусто. Нажми пресет выше или напиши свой текст.</p>
+                  )}
+                  {clips.filter(c => c.trackId === 'titles').map((c) => (
+                    <div key={c.id} className="flex items-center justify-between gap-2 p-1.5 rounded bg-[#150f0b] border border-[#231a12]">
+                      <button
+                        onClick={() => { setCurrentTime(c.startTime); setSelectedClipId(c.id); }}
+                        className="flex-1 min-w-0 text-left text-stone-300 hover:text-white"
+                        title="Перейти к моменту"
+                      >
+                        <span className="text-[10px] text-amber-400 font-mono">{c.startTime.toFixed(1)}с</span>
+                        <span className="text-[11px] block truncate">{c.text}</span>
+                      </button>
+                      <button
+                        onClick={() => setClips(clips.filter(x => x.id !== c.id))}
+                        className="p-1 rounded text-rose-300 hover:bg-rose-950/40"
+                        title="Удалить плашку"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
+                    </div>
                   ))}
                 </div>
               </div>
@@ -1110,12 +1157,46 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
             {inspectorTab === 'assembly' && (
               <div className="space-y-2.5 text-xs">
                 <div className="p-3 rounded-xl bg-[#18120d] border border-[#2b2014] text-stone-300 space-y-1.5">
-                  <div className="font-semibold text-white">Параметры рендера:</div>
-                  <div>• Разрешение: Full HD 1080p</div>
-                  <div>• Кодек: H.264 / AAC</div>
-                  <div>• Битрэйт: 12 Mbps (High Profile)</div>
-                  <div>• Метод: WebCodecs Hardware Acceleration</div>
+                  <div className="font-semibold text-white">Параметры рендера (реальные):</div>
+                  <div>• Разрешение: {getAspectRatioConfig(aspectRatio).width}×{getAspectRatioConfig(aspectRatio).height}</div>
+                  <div>• Частота: {fps} к/с</div>
+                  <div>• Кодек: {
+                    typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported('video/mp4;codecs=h264,aac')
+                      ? 'H.264 + AAC (MP4)'
+                      : typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
+                      ? 'VP9 + Opus (WebM в MP4-контейнере)'
+                      : 'VP8 + Opus (WebM в MP4-контейнере)'
+                  }</div>
+                  <div>• Битрейт видео: 3.5 Mbps</div>
+                  <div>• Аудио: {narrationClip?.audioUrl ? 'реальная озвучка + ambient' : 'только ambient (озвучки нет)'}</div>
+                  <div>• Метод: локальный MediaRecorder в браузере</div>
                 </div>
+                <div className="space-y-1.5">
+                  <label className="text-[10px] text-stone-400 font-mono block">Частота (fps):</label>
+                  <div className="flex gap-1.5">
+                    {[24, 30, 60].map((v) => (
+                      <button
+                        key={v}
+                        onClick={() => setFps(v)}
+                        className={`flex-1 py-1 rounded text-[11px] border transition-colors ${
+                          fps === v ? 'bg-amber-500/20 border-amber-500 text-amber-300' : 'bg-[#18120d] border-[#2c2014] text-stone-400 hover:text-stone-200'
+                        }`}
+                      >
+                        {v}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <button
+                  onClick={handleExportVideo}
+                  disabled={isExporting}
+                  className="w-full py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-black font-bold text-xs transition-all flex items-center justify-center gap-1.5 disabled:opacity-50"
+                >
+                  {isExporting ? <><div className="w-3 h-3 border-2 border-black border-t-transparent rounded-full animate-spin" /><span>{exportProgress}%</span></> : <><Download className="w-3.5 h-3.5 fill-black" /><span>Смонтировать и скачать</span></>}
+                </button>
+                <p className="text-[10px] text-stone-500 leading-normal">
+                  Рендер идёт в реальном времени — займёт столько же, сколько длится ролик, потому что записывается реальная озвучка. Вкладку до конца лучше не закрывать.
+                </p>
               </div>
             )}
           </div>
@@ -1330,6 +1411,34 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
           }}
         />
       )}
+    </div>
+  );
+};
+
+// Small inline input for the "Оформление" tab: type any text and add it as a
+// title-track clip at the current playhead. Kept as its own component so the
+// draft doesn't force a rerender of the whole MontageStudio on every keystroke.
+const CustomTitleInput: React.FC<{ onAdd: (text: string) => void }> = ({ onAdd }) => {
+  const [draft, setDraft] = useState('');
+  return (
+    <div className="pt-2 border-t border-[#231a12] space-y-1.5">
+      <label className="text-[10px] font-mono text-stone-400 block">Или своя плашка:</label>
+      <div className="flex gap-1.5">
+        <input
+          type="text"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder="Свой текст…"
+          className="flex-1 bg-[#18120d] border border-[#2c2014] rounded px-2 py-1 text-[11px] text-stone-200 placeholder-stone-600 focus:outline-none focus:border-amber-500/60"
+        />
+        <button
+          onClick={() => { if (draft.trim()) { onAdd(draft.trim()); setDraft(''); } }}
+          disabled={!draft.trim()}
+          className="px-2 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-300 text-[11px] disabled:opacity-40"
+        >
+          +
+        </button>
+      </div>
     </div>
   );
 };

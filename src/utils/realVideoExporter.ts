@@ -23,6 +23,15 @@ export interface VideoExportOptions {
   bgMusicVolume?: number;
   languageId?: string;
   onProgress?: ExportProgressCallback;
+  // The real narration mp3 (Lumean/uploaded). Piped into the recorded audio
+  // graph so the exported file actually has the user's voiceover instead of
+  // just the ambient sine drone.
+  narrationAudioUrl?: string;
+  // Match the Montage preview settings so what you saw is what you exported.
+  showSubtitles?: boolean;
+  showInFrameCaption?: boolean;
+  autoTransitions?: boolean;
+  transitionDuration?: number;
 }
 
 export async function exportRealTimelineVideo(options: VideoExportOptions): Promise<Blob> {
@@ -36,6 +45,11 @@ export async function exportRealTimelineVideo(options: VideoExportOptions): Prom
     bgMusicVolume = 0.2,
     languageId = 'ru',
     onProgress,
+    narrationAudioUrl,
+    showSubtitles = true,
+    showInFrameCaption = false,
+    autoTransitions = true,
+    transitionDuration = 0.5,
   } = options;
 
   // Determine canvas resolution based on aspect ratio
@@ -78,19 +92,41 @@ export async function exportRealTimelineVideo(options: VideoExportOptions): Prom
     console.warn('AudioContext not available for export, continuing video-only', err);
   }
 
-  // Generate synthetic music / tone track into destination
+  // Attach the real narration mp3 (if present) plus a very quiet ambient drone
+  // to the recorded audio stream. Before, only the sine wave was piped in —
+  // so exports were technically "with audio" but had no actual voiceover.
+  let narrationAudioEl: HTMLAudioElement | null = null;
   if (audioCtx && mediaDest) {
     try {
       const osc = audioCtx.createOscillator();
       const gain = audioCtx.createGain();
       osc.type = 'sine';
-      osc.frequency.setValueAtTime(110, audioCtx.currentTime); // Low cinematic A2 drone
-      gain.gain.setValueAtTime(bgMusicVolume * 0.15, audioCtx.currentTime);
+      osc.frequency.setValueAtTime(110, audioCtx.currentTime);
+      // Ducking: drone stays quiet when narration is present so the voice sits on top.
+      const droneLevel = (narrationAudioUrl ? 0.04 : 0.15) * bgMusicVolume;
+      gain.gain.setValueAtTime(droneLevel, audioCtx.currentTime);
       osc.connect(gain);
       gain.connect(mediaDest);
       osc.start();
-    } catch {
-      // ignore
+    } catch { /* ignore */ }
+    if (narrationAudioUrl) {
+      try {
+        narrationAudioEl = document.createElement('audio');
+        narrationAudioEl.src = narrationAudioUrl;
+        narrationAudioEl.crossOrigin = 'anonymous';
+        narrationAudioEl.preload = 'auto';
+        // Route mp3 through Web Audio so it hits the recorder's destination.
+        // NOTE: an element passed to createMediaElementSource is muted on
+        // ordinary playback; that's fine — its audio still reaches the graph.
+        const src = audioCtx.createMediaElementSource(narrationAudioEl);
+        const narrationGain = audioCtx.createGain();
+        narrationGain.gain.setValueAtTime(1.0, audioCtx.currentTime);
+        src.connect(narrationGain);
+        narrationGain.connect(mediaDest);
+      } catch (err) {
+        console.warn('Narration mp3 could not be attached to export audio graph:', err);
+        narrationAudioEl = null;
+      }
     }
   }
 
@@ -131,85 +167,112 @@ export async function exportRealTimelineVideo(options: VideoExportOptions): Prom
 
   recorder.start(100);
 
-  // Get active in-frame language caption
   const langConfig = ELEVEN_LANGUAGES.find((l) => l.id === languageId) || ELEVEN_LANGUAGES[0];
-  const inFrameCaption = langConfig.sampleCaption;
+  const inFrameCaption = showInFrameCaption ? langConfig.sampleCaption : undefined;
 
-  // Render loop
+  // Real-time render: MediaRecorder captures a live stream, and the narration
+  // <audio> element plays back in wall-clock time. So the render loop MUST
+  // advance ≈1000/fps ms per frame (setInterval), not as fast as rAF allows —
+  // otherwise a 693s script would be rendered in a minute of frames but the
+  // audio track would still be 693s and drift wildly out of sync.
   const totalFrames = Math.max(15, Math.ceil(totalDuration * fps));
   const frameIntervalMs = 1000 / fps;
+  const videoClipsSorted = clips.filter((c) => c.trackId === 'video').sort((a, b) => a.startTime - b.startTime);
 
   return new Promise<Blob>((resolve, reject) => {
     let currentFrame = 0;
+    let intervalId: number | null = null;
+    const startWallClock = performance.now();
 
-    const renderNextFrame = () => {
-      if (currentFrame >= totalFrames) {
-        recorder.onstop = () => {
-          if (audioCtx) {
-            audioCtx.close().catch(() => {});
-          }
-          const finalBlob = new Blob(recordedChunks, { type: mimeType });
+    // Start the real narration element (if any) as close to the recorder as
+    // possible so audio and video timelines share the same t=0.
+    if (narrationAudioEl) {
+      narrationAudioEl.currentTime = 0;
+      narrationAudioEl.play().catch((err) => {
+        console.warn('Narration playback in exporter failed to start:', err);
+      });
+    }
 
-          // Trigger real browser download
-          const url = URL.createObjectURL(finalBlob);
-          const link = document.createElement('a');
-          const ext = mimeType.includes('mp4') ? 'mp4' : 'mp4'; // name as mp4 for player compatibility
-          link.href = url;
-          link.download = `${projectName.replace(/[^a-zA-Z0-9а-яА-ЯёЁ_-]/g, '_')}_GoldFlow.${ext}`;
-          document.body.appendChild(link);
-          link.click();
-          document.body.removeChild(link);
-          setTimeout(() => URL.revokeObjectURL(url), 20000);
+    const finalize = () => {
+      if (intervalId !== null) window.clearInterval(intervalId);
+      if (narrationAudioEl) narrationAudioEl.pause();
+      recorder.onstop = () => {
+        if (audioCtx) audioCtx.close().catch(() => {});
+        const finalBlob = new Blob(recordedChunks, { type: mimeType });
+        const url = URL.createObjectURL(finalBlob);
+        const link = document.createElement('a');
+        const ext = mimeType.includes('mp4') ? 'mp4' : 'webm';
+        link.href = url;
+        link.download = `${projectName.replace(/[^a-zA-Z0-9а-яА-ЯёЁ_-]/g, '_')}_GoldFlow.${ext}`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        setTimeout(() => URL.revokeObjectURL(url), 20000);
+        resolve(finalBlob);
+      };
+      recorder.stop();
+    };
 
-          resolve(finalBlob);
-        };
-        recorder.stop();
-        return;
-      }
-
-      const currentTimeSec = (currentFrame / totalFrames) * totalDuration;
-
-      // Find active video clip
-      const activeVideoClip = clips.find(
-        (c) => c.trackId === 'video' && currentTimeSec >= c.startTime && currentTimeSec < c.startTime + c.duration
-      ) || clips.find((c) => c.trackId === 'video') || clips[0];
-
-      // Find active voice / subtitle clip
+    const renderFrameAt = (currentTimeSec: number) => {
+      // Active video clip at this timeline second.
+      const activeVideoClip = videoClipsSorted.find(
+        (c) => currentTimeSec >= c.startTime && currentTimeSec < c.startTime + c.duration
+      ) || videoClipsSorted[0] || clips[0];
       const activeVoiceClip = clips.find(
         (c) => c.trackId === 'voice' && currentTimeSec >= c.startTime && currentTimeSec < c.startTime + c.duration
       );
-
-      // Find corresponding StoryScene
-      const sceneIndex = clips.filter((c) => c.trackId === 'video').indexOf(activeVideoClip);
+      const sceneIndex = activeVideoClip ? videoClipsSorted.indexOf(activeVideoClip) : 0;
       const scene = scenes[sceneIndex] || scenes[0];
-
       const sceneTime = activeVideoClip ? currentTimeSec - activeVideoClip.startTime : 1.0;
       const sceneDuration = activeVideoClip ? activeVideoClip.duration : 4.0;
 
-      // Draw the scene frame
+      // Cross-fade at the end of the clip (matches the Montage preview).
+      let transProgress = 0;
+      if (autoTransitions && activeVideoClip && sceneTime > sceneDuration - transitionDuration) {
+        transProgress = Math.min(1, (sceneTime - (sceneDuration - transitionDuration)) / transitionDuration);
+      }
+
+      // Subtitles: prefer per-cue text on the voice track, else fall back to
+      // the current scene's own line — matches the Montage preview so what
+      // the user previewed is what they downloaded.
+      const subtitleText = showSubtitles
+        ? (activeVoiceClip?.text || scene?.description || undefined)
+        : undefined;
+
       drawProceduralScene(ctx, width, height, {
         sceneId: scene?.id || sceneIndex + 1,
         title: scene?.title || activeVideoClip?.name || 'GoldFlow Кадр',
         timeSec: sceneTime,
         durationSec: sceneDuration,
         motionType: scene?.motionType || activeVideoClip?.motion || 'zoom-in',
+        transitionProgress: transProgress * 0.75,
         aspectRatio,
-        activeSubtitle: activeVoiceClip?.text,
+        activeSubtitle: subtitleText,
         imageUrl: activeVideoClip?.imageUrl || scene?.generatedImageUrl,
-        inFrameCaption, // In-frame caption in chosen language
+        inFrameCaption,
       });
-
-      // Progress reporting
-      currentFrame++;
-      const progressPercent = Math.min(99, Math.round((currentFrame / totalFrames) * 100));
-      if (onProgress && currentFrame % 4 === 0) {
-        onProgress(progressPercent, `Рендеринг кадра ${currentFrame} из ${totalFrames} (${currentTimeSec.toFixed(1)}с)`);
-      }
-
-      // Schedule next frame with requestAnimationFrame for smooth capture
-      requestAnimationFrame(renderNextFrame);
     };
 
-    renderNextFrame();
+    intervalId = window.setInterval(() => {
+      const elapsed = (performance.now() - startWallClock) / 1000;
+      // Prefer the real audio clock when it's playing — keeps video locked to
+      // the true narration timeline even if setInterval drifts.
+      const currentTimeSec = narrationAudioEl && narrationAudioEl.currentTime > 0
+        ? narrationAudioEl.currentTime
+        : elapsed;
+
+      if (currentTimeSec >= totalDuration || currentFrame >= totalFrames) {
+        finalize();
+        return;
+      }
+
+      renderFrameAt(currentTimeSec);
+      currentFrame++;
+
+      const progressPercent = Math.min(99, Math.round((currentTimeSec / totalDuration) * 100));
+      if (onProgress && currentFrame % 4 === 0) {
+        onProgress(progressPercent, `Рендеринг ${currentTimeSec.toFixed(1)}с из ${totalDuration.toFixed(1)}с`);
+      }
+    }, frameIntervalMs);
   });
 }
