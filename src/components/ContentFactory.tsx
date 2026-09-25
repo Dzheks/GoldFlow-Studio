@@ -4,7 +4,7 @@ import { ProjectData, StylePreset, CharacterItem, LocationItem, StoryScene } fro
 import { GENERATION_MODELS, getModelByCode } from '../config/models';
 import { ASPECT_RATIO_OPTIONS, getAspectRatioConfig, AspectRatioKey } from '../config/aspectRatios';
 import { generateSceneThumbnailDataUrl } from '../utils/proceduralCanvas';
-import { buildSynchronizedTimeline, estimateSpeechDuration, splitScriptIntoSentenceLines, splitScriptIntoParagraphGroups, groupParagraphsIntoBatches, splitScenesByDurationCap } from '../utils/autoAssembly';
+import { buildSynchronizedTimeline, estimateSpeechDuration, splitScriptIntoSentenceLines, splitScriptIntoParagraphGroups, groupParagraphsIntoBatches, splitScenesByDurationCap, transliterateToLatin } from '../utils/autoAssembly';
 import { FlowImportModal } from './FlowImportModal';
 import { ParsedFlowFrame } from '../utils/flowResponseParser';
 import { NineFieldsEditorModal } from './NineFieldsEditorModal';
@@ -180,6 +180,11 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
   const [isStyleModalOpen, setIsStyleModalOpen] = useState<boolean>(false);
   const [editingStyleId, setEditingStyleId] = useState<string | null>(null);
   const [heroRefImage, setHeroRefImage] = useState<{ base64: string; mimeType: string } | null>(project.heroRefImage || null);
+  // Эталон героя generates automatically, but not every batch needs it (a
+  // scenery/compilation video with no recurring character, for instance) —
+  // real on/off switch so the user decides per-run, Whisk-style, instead of
+  // it always being force-applied.
+  const [useHeroReference, setUseHeroReference] = useState<boolean>(true);
   const [heroName, setHeroName] = useState<string>(project.heroName || '');
   // Separate narrator/host reference — a real person's photo the user
   // uploads, distinct from the AI-generated story hero. Used only on scenes
@@ -230,11 +235,35 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
   // Whisk-style manual references: any character/location the user attached
   // a photo to gets pulled in by name whenever a scene's text mentions them,
   // so their face/location stays consistent instead of drifting per frame.
+  // Whole-word match (Latin + Cyrillic letters count as "word" characters) —
+  // a plain .includes() let short transliterated names match INSIDE unrelated
+  // words (e.g. a 3-letter name matching part of some other word in the
+  // prompt), silently attaching the wrong person's/place's reference photo
+  // to scenes that never mentioned them.
+  const containsWholeName = (haystack: string, name: string): boolean => {
+    if (!name) return false;
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`(?<![a-zа-яё0-9])${escaped}(?![a-zа-яё0-9])`, 'i');
+    return re.test(haystack);
+  };
+
   const buildCastReferences = (text: string): { name: string; base64: string; mimeType: string }[] => {
+    // Names get typed in whatever script the user's UI language uses (e.g.
+    // Cyrillic "Матео"), but the actual image prompt is always compiled in
+    // English (nineFields are English by design — see promptLangNote in
+    // server.ts), so it says "Mateo" in Latin script. A raw substring check
+    // between "матео" and "mateo" never matches — the reference silently
+    // never got attached even with a real photo uploaded. Transliterate both
+    // sides to a common Latin form before comparing (on top of the direct
+    // check, for names already given in Latin/English), matched as a whole
+    // word so short names can't false-positive inside unrelated words.
     const lower = text.toLowerCase();
-    const entries = [...characters, ...locations].filter(
-      (e) => e.customImage && e.name.trim() && lower.includes(e.name.trim().toLowerCase())
-    );
+    const latinized = transliterateToLatin(lower);
+    const entries = [...characters, ...locations].filter((e) => {
+      if (!e.customImage || !e.name.trim()) return false;
+      const name = e.name.trim().toLowerCase();
+      return containsWholeName(lower, name) || containsWholeName(latinized, transliterateToLatin(name));
+    });
     return entries
       .map((e) => {
         const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(e.customImage || '');
@@ -933,6 +962,39 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
     }
   };
 
+  // Same trick "Эталон героя" already uses: redraw the uploaded photo,
+  // identity-locked from it, in the batch's own art style — a raw uploaded
+  // photo (often a real photograph or a different art style entirely) fights
+  // the generated frames' look, which was likely hurting consistency at
+  // least as much as the name-matching bug it was reported alongside.
+  const handleGenerateStyledCharacterRef = async (imageDataUrl: string): Promise<string | null> => {
+    const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(imageDataUrl);
+    if (!match) {
+      showToast('❌ Не удалось прочитать загруженное фото');
+      return null;
+    }
+    const activeCustomStyleForRef = customStyles.find((s) => s.id === selectedStyleId);
+    const stylePrompt = 'Redraw this exact person as a clean character reference portrait, preserving their face and identity precisely. Plain neutral background, consistent reference look.';
+    try {
+      const res = await generateImageReal({
+        prompt: activeCustomStyleForRef?.negativePrompt ? `${stylePrompt} Avoid: ${activeCustomStyleForRef.negativePrompt}` : stylePrompt,
+        modelCode: selectedModel,
+        aspectRatio: '1:1',
+        heroReferenceImage: { base64: match[2], mimeType: match[1] },
+        styleReferenceImages: activeCustomStyleForRef?.referenceImages,
+      });
+      if (!res.imageBase64) {
+        showToast(`❌ Не удалось перерисовать эталон${res.error ? `: ${res.error}` : ''}`);
+        return null;
+      }
+      showToast('✨ Эталон перерисован в стиле проекта');
+      return `data:${res.mimeType || 'image/png'};base64,${res.imageBase64}`;
+    } catch (err: any) {
+      showToast(`❌ Ошибка: ${err?.message || 'неизвестная'}`);
+      return null;
+    }
+  };
+
   const handleSaveCharacterRef = (data: { name: string; role: string; customImage?: string }) => {
     if (!refModal) return;
     const palette = ['#d97706', '#8b5cf6', '#10b981', '#3b82f6', '#ef4444', '#ec4899', '#14b8a6', '#f59e0b'];
@@ -1013,9 +1075,10 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
         : cleanPrompt;
 
       // castRole picks which face reference goes in: the story's own hero
-      // (default) or the separate narrator/host reference for shots marked
-      // as such in "Материалы".
-      const faceRef = scenesRef[idx].castRole === 'narrator' ? narratorRefImage : heroRefImage;
+      // (default, only if the "Эталон героя" toggle is on) or the separate
+      // narrator/host reference for shots explicitly marked as such in
+      // "Материалы" — that's a per-scene choice, unaffected by the toggle.
+      const faceRef = scenesRef[idx].castRole === 'narrator' ? narratorRefImage : (useHeroReference ? heroRefImage : null);
       const imgRes = await generateImageReal({
         prompt: styledPrompt,
         modelCode: selectedModel,
@@ -1091,7 +1154,7 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
         ? `${scene.prompt}. Avoid: ${activeCustomStyle.negativePrompt}`
         : scene.prompt;
 
-      const faceRef = scene.castRole === 'narrator' ? narratorRefImage : heroRefImage;
+      const faceRef = scene.castRole === 'narrator' ? narratorRefImage : (useHeroReference ? heroRefImage : null);
       const imgRes = await generateImageReal({
         prompt: styledPrompt,
         modelCode: selectedModel,
@@ -2043,19 +2106,40 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
               {/* API Request Preview Info & Flow Session Status */}
               <div className="space-y-2">
                 {heroRefImage && (
-                  <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-emerald-950/20 border border-emerald-500/30 text-[11px] font-mono text-emerald-300">
+                  <div
+                    className={`flex items-center gap-2 px-3 py-2 rounded-xl border text-[11px] font-mono transition-colors ${
+                      useHeroReference
+                        ? 'bg-emerald-950/20 border-emerald-500/30 text-emerald-300'
+                        : 'bg-[#161310] border-[#332b1f] text-stone-500'
+                    }`}
+                  >
                     <img
                       src={`data:${heroRefImage.mimeType};base64,${heroRefImage.base64}`}
                       alt="hero"
                       onClick={() => setIsHeroPreviewOpen(true)}
-                      className="w-6 h-6 rounded object-cover border border-emerald-500/40 cursor-pointer hover:ring-2 hover:ring-emerald-400/60 transition-all shrink-0"
+                      className={`w-6 h-6 rounded object-cover border cursor-pointer hover:ring-2 transition-all shrink-0 ${
+                        useHeroReference ? 'border-emerald-500/40 hover:ring-emerald-400/60' : 'border-stone-700 opacity-50 hover:ring-stone-500/60'
+                      }`}
                       title="Посмотреть эталон героя в полном размере"
                     />
-                    <span>Эталон героя «{heroName}» подключён — каждый кадр пачки получит его как референс для консистентности.</span>
+                    <span>
+                      {useHeroReference
+                        ? <>Эталон героя «{heroName}» подключён — каждый кадр пачки получит его как референс для консистентности.</>
+                        : <>Эталон героя «{heroName}» есть, но выключен — пачка сгенерируется без него.</>}
+                    </span>
+                    <label className="ml-auto flex items-center gap-1.5 shrink-0 cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={useHeroReference}
+                        onChange={(e) => setUseHeroReference(e.target.checked)}
+                        className="accent-emerald-500 w-3.5 h-3.5"
+                      />
+                      <span>{useHeroReference ? 'Включён' : 'Выключен'}</span>
+                    </label>
                     <button
                       type="button"
                       onClick={() => setIsHeroPreviewOpen(true)}
-                      className="ml-auto shrink-0 underline text-emerald-300 hover:text-emerald-200"
+                      className="shrink-0 underline hover:text-emerald-200"
                     >
                       Посмотреть
                     </button>
@@ -2927,6 +3011,7 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
           }
           onClose={() => setRefModal(null)}
           onSave={handleSaveCharacterRef}
+          onGenerateStyledRef={handleGenerateStyledCharacterRef}
         />
       )}
 

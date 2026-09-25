@@ -192,8 +192,24 @@ async function startServer() {
   // AI Studio model picker if generation starts returning 404/"model not found".
   const IMAGE_MODEL_MAP: Record<string, string> = {
     HARBOR_SEAL: 'gemini-2.5-flash-image', // Nano Banana 2 Lite
-    NARWHAL: 'gemini-2.5-flash-image', // Nano Banana 2 (no confirmed distinct public id yet, uses same fast model)
+    NARWHAL: 'gemini-2.5-flash-image', // Nano Banana 2 — still the same underlying
+    // flash model as Lite (no distinct public id exists yet). Tried forcing
+    // 2K via imageSize to give it a real edge over Lite — pulled it back out:
+    // a user hit visibly broken/abstract output right after, and this model
+    // isn't documented as supporting non-default sizes, so 2K on it is an
+    // unverified risk, not a confirmed win. GEM_PIX_2 is a genuinely
+    // different, more capable model (gemini-3-pro-image-preview), so 2K
+    // there is a safer bet. Until Google ships an actual distinct "NB2"
+    // model id, Lite and standard really are the same thing at 1K — that's
+    // the honest state, not a fake distinction dressed up as real.
     GEM_PIX_2: 'gemini-3-pro-image-preview', // Nano Banana Pro
+  };
+  // Real resolution tiers (Gemini image API's own imageSize config: 1K/2K/4K,
+  // defaults to 1K if unset).
+  const IMAGE_SIZE_MAP: Record<string, string> = {
+    HARBOR_SEAL: '1K',
+    NARWHAL: '1K',
+    GEM_PIX_2: '2K',
   };
   const TEXT_MODEL = 'gemini-3.1-pro-preview'; // gemini-2.5-pro retired for new keys as of this session's live test
   const MOTION_OPTIONS = ['zoom-in', 'zoom-out', 'pan-left', 'pan-right', 'static'];
@@ -870,7 +886,12 @@ async function startServer() {
       const result: any = await ai.models.generateContent({
         model,
         contents: [{ role: 'user', parts }],
-        config: { imageConfig: { aspectRatio: aspectRatio || '16:9' } } as any,
+        config: {
+          imageConfig: {
+            aspectRatio: aspectRatio || '16:9',
+            imageSize: IMAGE_SIZE_MAP[modelCode as string] || '1K',
+          },
+        } as any,
       });
 
       const imagePart = result.candidates?.[0]?.content?.parts?.find((p: any) => p.inlineData);

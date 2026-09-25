@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { X, Upload, RefreshCw, User, MapPin } from 'lucide-react';
+import { X, Upload, RefreshCw, User, MapPin, Sparkles } from 'lucide-react';
 
 interface CharacterReferenceModalProps {
   isOpen: boolean;
@@ -9,6 +9,13 @@ interface CharacterReferenceModalProps {
   initialImage?: string;
   onClose: () => void;
   onSave: (data: { name: string; role: string; customImage?: string }) => void;
+  // Same trick the auto-generated "Эталон героя" already uses: redraw the
+  // uploaded photo, identity-locked, in the project's own art style — so
+  // this reference doesn't fight the batch's style the way a raw real photo
+  // (or any off-style image) can. Returns the new data URL, or null on
+  // failure (image is left unchanged). Omit the prop to hide the button
+  // entirely (e.g. no style/API context available).
+  onGenerateStyledRef?: (image: string) => Promise<string | null>;
 }
 
 function fileToDataUrl(file: File): Promise<string> {
@@ -28,11 +35,13 @@ export const CharacterReferenceModal: React.FC<CharacterReferenceModalProps> = (
   initialImage,
   onClose,
   onSave,
+  onGenerateStyledRef,
 }) => {
   const [name, setName] = useState(initialName || '');
   const [role, setRole] = useState(initialRole || '');
   const [image, setImage] = useState<string | undefined>(initialImage);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isStyling, setIsStyling] = useState(false);
 
   useEffect(() => {
     if (isOpen) {
@@ -61,6 +70,17 @@ export const CharacterReferenceModal: React.FC<CharacterReferenceModalProps> = (
     const item = Array.from(e.clipboardData.items).find((i) => i.type.startsWith('image/'));
     const file = item?.getAsFile();
     if (file) await handleFile(file);
+  };
+
+  const handleGenerateStyled = async () => {
+    if (!image || !onGenerateStyledRef) return;
+    setIsStyling(true);
+    try {
+      const styled = await onGenerateStyledRef(image);
+      if (styled) setImage(styled);
+    } finally {
+      setIsStyling(false);
+    }
   };
 
   const handleSave = () => {
@@ -125,15 +145,34 @@ export const CharacterReferenceModal: React.FC<CharacterReferenceModalProps> = (
           </label>
           <div className="flex items-center gap-3">
             {image ? (
-              <div className="relative w-20 h-20 rounded-lg overflow-hidden border border-amber-500/40 group">
-                <img src={image} alt={name} className="w-full h-full object-cover" />
-                <button
-                  onClick={() => setImage(undefined)}
-                  className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity"
-                >
-                  <X className="w-4 h-4 text-white" />
-                </button>
-              </div>
+              <>
+                <div className="relative w-20 h-20 rounded-lg overflow-hidden border border-amber-500/40 group">
+                  <img src={image} alt={name} className="w-full h-full object-cover" />
+                  {isStyling && (
+                    <div className="absolute inset-0 bg-black/70 flex items-center justify-center">
+                      <RefreshCw className="w-4 h-4 text-amber-400 animate-spin" />
+                    </div>
+                  )}
+                  <button
+                    onClick={() => setImage(undefined)}
+                    className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity"
+                  >
+                    <X className="w-4 h-4 text-white" />
+                  </button>
+                </div>
+                {onGenerateStyledRef && (
+                  <button
+                    type="button"
+                    onClick={handleGenerateStyled}
+                    disabled={isStyling}
+                    className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-[#1c150e] hover:bg-[#2c2117] border border-amber-500/30 text-amber-300 hover:text-amber-200 text-[11px] font-medium transition-colors disabled:opacity-50"
+                    title="Как у эталона героя: перерисовать фото в стиле проекта, сохранив лицо"
+                  >
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>{isStyling ? 'Рисуем...' : 'Эталон в стиле проекта'}</span>
+                  </button>
+                )}
+              </>
             ) : (
               <label className="w-20 h-20 rounded-lg border border-dashed border-[#443322] hover:border-amber-500/60 bg-[#16100c] flex items-center justify-center cursor-pointer transition-colors">
                 {isProcessing ? (
