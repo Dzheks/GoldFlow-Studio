@@ -225,7 +225,8 @@ export function buildSynchronizedTimeline(
   scenes: StoryScene[],
   aspectRatio: AspectRatio = '16:9',
   styleTheme: string = 'cinematic',
-  clipHoldDuration: number = 4.0
+  clipHoldDuration: number = 4.0,
+  narrationAudioUrl?: string,
 ): {
   timelineClips: TimelineClip[];
   totalDuration: number;
@@ -235,24 +236,15 @@ export function buildSynchronizedTimeline(
 
   let currentPlayhead = 0;
 
-  // 1. Build Video and Voice tracks in perfect sync
+  // 1. Build Video and Voice tracks in perfect sync.
   scenes.forEach((scene, index) => {
-    // If scene has explicit duration or estimate from prompt/description
     const sceneDuration = scene.duration || clipHoldDuration;
     const color = videoColors[index % videoColors.length];
 
-    // Ensure thumbnail image exists for scene
     const imageUrl =
       scene.generatedImageUrl ||
-      generateSceneThumbnailDataUrl(
-        scene.id,
-        scene.title,
-        scene.prompt,
-        aspectRatio,
-        styleTheme
-      );
+      generateSceneThumbnailDataUrl(scene.id, scene.title, scene.prompt, aspectRatio, styleTheme);
 
-    // Video Clip
     newClips.push({
       id: `clip-video-${scene.id}-${Date.now()}-${index}`,
       trackId: 'video',
@@ -266,22 +258,43 @@ export function buildSynchronizedTimeline(
       transitionDuration: 0.5,
     });
 
-    // Voice Clip exactly matching this video beat
-    newClips.push({
-      id: `clip-voice-${scene.id}-${Date.now()}-${index}`,
-      trackId: 'voice',
-      name: `Озвучка: Кадр ${index + 1}`,
-      startTime: currentPlayhead,
-      duration: sceneDuration,
-      color: '#2563eb',
-      volume: 1.0,
-      text: scene.description || scene.title,
-    });
+    // Only emit per-scene voice clips when there's NO real narration file —
+    // otherwise a single audio clip below plays the whole track continuously,
+    // and the per-beat clips would just be duplicated silent placeholders on
+    // top of it.
+    if (!narrationAudioUrl) {
+      newClips.push({
+        id: `clip-voice-${scene.id}-${Date.now()}-${index}`,
+        trackId: 'voice',
+        name: `Озвучка: Кадр ${index + 1}`,
+        startTime: currentPlayhead,
+        duration: sceneDuration,
+        color: '#2563eb',
+        volume: 1.0,
+        text: scene.description || scene.title,
+      });
+    }
 
     currentPlayhead += sceneDuration;
   });
 
   const totalDuration = Math.max(12, Math.round(currentPlayhead * 10) / 10);
+
+  // Real narration: one continuous voice clip spans the whole video — the
+  // player attaches an <audio> to its audioUrl, so play/pause/seek actually
+  // scrubs the real recorded voiceover instead of the browser TTS fallback.
+  if (narrationAudioUrl) {
+    newClips.push({
+      id: `clip-voice-narration-${Date.now()}`,
+      trackId: 'voice',
+      name: 'Реальная озвучка',
+      startTime: 0,
+      duration: totalDuration,
+      color: '#1d4ed8',
+      volume: 1.0,
+      audioUrl: narrationAudioUrl,
+    });
+  }
 
   // 2. Add Ambient Background Music Track spanning the whole video
   newClips.push({

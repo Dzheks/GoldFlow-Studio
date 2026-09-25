@@ -16,7 +16,7 @@ import { AutomatedPipelineRunner } from './AutomatedPipelineRunner';
 import { compileNineFieldsPrompt, DirectorNineFields } from '../types/goldflow';
 import { ELEVEN_LANGUAGES } from '../types/languages';
 import { generateGoldflowPipeline } from '../utils/goldflowPipeline';
-import { generateScriptReal, generateImageReal, parseSceneElementsReal, synthesizeVoiceReal, transcribeVoiceReal, GeneratedBlock, GeneratedHero } from '../services/geminiPipelineClient';
+import { generateScriptReal, generateImageReal, parseSceneElementsReal, synthesizeVoiceReal, transcribeVoiceReal, generateMicrobeatsReal, GeneratedBlock, GeneratedHero } from '../services/geminiPipelineClient';
 import { 
   generateSmartScript, 
   parseScriptToPromptLines, 
@@ -539,7 +539,7 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
         showToast(`⚠️ Озвучка не удалась (${err?.message || 'ошибка'}) — тайминг остался оценочным.`);
       }
 
-      await finalizeAndCommit(newScenes, res.heroMaster, fullScript, narrationAudioUrl);
+      await finalizeAndCommit(newScenes, res.heroMaster, fullScript, narrationAudioUrl, res.blocks);
     } catch (err: any) {
       showToast(`❌ Ошибка генерации сценария: ${err?.message || 'неизвестная ошибка'}`);
     } finally {
@@ -556,20 +556,69 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
     heroMaster: GeneratedHero,
     fullScript: string,
     narrationAudioUrl: string | undefined,
+    blocks?: GeneratedBlock[],
   ) => {
-    // splitScenesByDurationCap (autoAssembly.ts) owns the actual math: exact
-    // user spec is N = floor(sec/4), so a 6s scene stays whole (6/2=3 < 4)
-    // instead of getting cut into two sub-4s shots — round() here would
-    // violate that. Single source of truth for every script mode that calls
-    // finalizeAndCommit (custom text, uploaded voiceover, Lumean tab, etc).
-    const expandedScenes = splitScenesByDurationCap(scenesWithDurations);
+    // First split by duration (N = floor(sec/4), 6s stays whole) — this gives
+    // us numeric shot count. Then, for every block that needed subdivision, ask
+    // the director AI for N distinct micro-beats (each with its OWN nineFields)
+    // so the N shots show different visual moments of the same scene instead of
+    // the same nineFields with a "Camera angle N of M" suffix — the latter made
+    // Nano Banana literalize the numbers as signs/clocks.
+    let expandedScenes = splitScenesByDurationCap(scenesWithDurations);
+
+    if (blocks && blocks.length === scenesWithDurations.length) {
+      showToast(`🎨 Раскадровываю микро-биты внутри длинных блоков (это ещё ~30 сек)…`);
+      const rebuilt: StoryScene[] = [];
+      let cursor = 0;
+      for (let bi = 0; bi < scenesWithDurations.length; bi++) {
+        const block = blocks[bi];
+        const parentDur = scenesWithDurations[bi].duration;
+        const subshotCount = Math.max(1, Math.min(12, Math.floor(parentDur / 4)));
+        const slice = expandedScenes.slice(cursor, cursor + Math.max(1, subshotCount));
+        cursor += slice.length;
+        if (slice.length <= 1 || !block?.nineFields) {
+          rebuilt.push(...slice);
+          continue;
+        }
+        try {
+          const mb = await generateMicrobeatsReal({
+            scriptLine: block.scriptLine,
+            blockNineFields: block.nineFields,
+            heroMaster: {
+              name: heroMaster.name,
+              appearance: heroMaster.appearance,
+              clothing: heroMaster.clothing,
+              keyFeature: heroMaster.keyFeature,
+            },
+            subshotCount: slice.length,
+            language: scriptLanguage,
+          });
+          if (mb.beats && mb.beats.length === slice.length) {
+            slice.forEach((sc, i) => {
+              const prompt = compileNineFieldsPrompt(mb.beats![i], heroMaster.name);
+              rebuilt.push({ ...sc, prompt });
+            });
+          } else {
+            rebuilt.push(...slice);
+          }
+        } catch {
+          rebuilt.push(...slice);
+        }
+      }
+      // Renumber ids and clean the confusing "(ракурс N/M)" suffix from titles.
+      expandedScenes = rebuilt.map((s, idx) => ({
+        ...s,
+        id: idx + 1,
+        title: s.title.replace(/\s*\(ракурс\s+\d+\/\d+\)\s*$/, ''),
+      }));
+    }
 
     const expandedPromptsText = expandedScenes.map((s, i) => `${i + 1}. ${s.prompt}`).join('\n');
     setPromptsText(expandedPromptsText);
     const finalTotalSec = Math.round(expandedScenes.reduce((a, s) => a + s.duration, 0));
     showToast(`🎬 Итог: ${scenesWithDurations.length} сцен → ${expandedScenes.length} кадров, суммарно ${finalTotalSec} сек ролика.`);
 
-    const { timelineClips, totalDuration } = buildSynchronizedTimeline(expandedScenes, selectedRatio, selectedStyleId);
+    const { timelineClips, totalDuration } = buildSynchronizedTimeline(expandedScenes, selectedRatio, selectedStyleId, 4.0, narrationAudioUrl);
     onUpdateProject({ scriptText: fullScript, scenes: expandedScenes, timelineClips, duration: totalDuration, narrationAudioUrl, heroName: heroMaster.name });
 
     try {
@@ -710,7 +759,7 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
       newScenes.forEach((s) => { if (!(s.duration > 0)) s.duration = 4; });
 
       showToast(`🎬 Тайминг взят из реальных таймкодов Lumean (${Math.round(totalSec)} сек, ${allBlocks.length} блоков) — режу по паузам.`);
-      await finalizeAndCommit(newScenes, sharedHero, fullScript, lumeanResult.audioUrl);
+      await finalizeAndCommit(newScenes, sharedHero, fullScript, lumeanResult.audioUrl, allBlocks);
     } catch (err: any) {
       showToast(`❌ Ошибка сборки (${err?.message || 'сбой'})`);
     } finally {
@@ -903,7 +952,8 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
       scenesRef,
       selectedRatio,
       selectedStyleId,
-      project.clipHoldDuration || 4.0
+      project.clipHoldDuration || 4.0,
+      project.narrationAudioUrl,
     );
 
     onUpdateProject({
@@ -970,7 +1020,8 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
         updatedScenes,
         selectedRatio,
         selectedStyleId,
-        project.clipHoldDuration || 4.0
+        project.clipHoldDuration || 4.0,
+        project.narrationAudioUrl,
       );
       onUpdateProject({ scenes: updatedScenes, timelineClips });
       showToast(`✅ Кадр ${sceneId} перегенерирован реально через ${activeModel.name}`);

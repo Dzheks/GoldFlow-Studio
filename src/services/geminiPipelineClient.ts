@@ -211,6 +211,27 @@ export async function fetchLumeanVoiceById(id: string): Promise<{ voice?: VoiceL
   }
 }
 
+export async function generateMicrobeatsReal(payload: {
+  scriptLine: string;
+  blockNineFields: NineFieldsResult;
+  heroMaster?: { name?: string; appearance?: string; clothing?: string; keyFeature?: string };
+  subshotCount: number;
+  language?: string;
+}): Promise<{ beats?: NineFieldsResult[]; error?: string }> {
+  try {
+    const res = await fetch('/api/generate-microbeats', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok) return { error: data?.error || 'Ошибка микро-битов' };
+    return { beats: data.beats };
+  } catch (err: any) {
+    return { error: err?.message || 'Сервер недоступен' };
+  }
+}
+
 export interface TranscribeVoiceResult {
   text?: string;
   durationMs?: number | null;

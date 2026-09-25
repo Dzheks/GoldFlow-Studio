@@ -684,6 +684,48 @@ async function startServer() {
     }
   });
 
+  // Micro-beats: given one script block that runs long enough to hold N shots,
+  // ask the director AI to break its VISUAL beat into N distinct micro-scenes
+  // — each with its own nineFields (different action/moment/foreground, but
+  // sharing location/light/texture so they read as the same setting). This is
+  // the real fix for "12 identical copies of one scene with fake camera-angle
+  // syntax": each of the N sub-shots now shows a different visual moment of
+  // the same narrated block, matching what a real edit would cut to.
+  app.post('/api/generate-microbeats', async (req, res) => {
+    try {
+      const { scriptLine, blockNineFields, heroMaster, subshotCount, language } = req.body || {};
+      if (!apiKey) return res.status(503).json({ error: 'GEMINI_API_KEY не настроен в окружении' });
+      const n = Math.max(2, Math.min(12, Number(subshotCount) || 2));
+      if (!scriptLine || !blockNineFields) return res.status(400).json({ error: 'Нужны scriptLine и blockNineFields' });
+
+      const heroLine = heroMaster
+        ? `Character: ${heroMaster.name}, ${heroMaster.appearance || ''}, wearing ${heroMaster.clothing || ''}, key feature: ${heroMaster.keyFeature || ''}.`
+        : '';
+      const langName = language === 'en' ? 'английском' : 'русском';
+
+      const instruction = `Ты — режиссёр монтажа. Дана одна кинематографическая сцена и её базовые 9 полей режиссёра. Она звучит ${n}×~4 сек в озвучке, поэтому нужно ${n} отдельных кинокадров, показывающих РАЗНЫЕ ВИЗУАЛЬНЫЕ МОМЕНТЫ этой же сцены (что делает герой в начале, в середине, к концу; на что смотрит; куда движется; какая деталь бросается в глаза). Все ${n} кадров сохраняют ту же location, light и texture (это одна локация), но action, moment, foreground, lens и background меняются от кадра к кадру, чтобы это читалось как настоящий монтаж, а не ${n} копий одного плана. Никаких табличек, вывесок, часов и цифр в кадре — это документальный кинокадр. ${heroLine}\n\nБазовые 9 полей блока (используй их как якорь для location/light/texture):\nlens: ${blockNineFields.lens}\naction: ${blockNineFields.action}\nmoment: ${blockNineFields.moment}\nforeground: ${blockNineFields.foreground}\nlocation: ${blockNineFields.location}\nbackground: ${blockNineFields.background}\ntexture: ${blockNineFields.texture}\nlight: ${blockNineFields.light}\nmood: ${blockNineFields.mood}\n\nТекст сцены (для контекста, не менять): "${scriptLine}"\n\nВерни массив из РОВНО ${n} объектов nineFields на английском языке (все 9 полей ОБЯЗАТЕЛЬНЫ, поле lens и action должны реально отличаться между кадрами). Заголовки ${langName} не нужны — только nineFields.`;
+
+      const schema = {
+        type: 'object',
+        properties: { beats: { type: 'array', items: nineFieldsSchema } },
+        required: ['beats'],
+      };
+
+      const result: any = await ai.models.generateContent({
+        model: TEXT_MODEL,
+        contents: [{ role: 'user', parts: [{ text: instruction }] }],
+        config: { responseMimeType: 'application/json', responseSchema: schema as any },
+      });
+      const parsed = JSON.parse(result.text || '{}');
+      const beats = Array.isArray(parsed.beats) ? parsed.beats.slice(0, n) : [];
+      if (beats.length === 0) return res.status(502).json({ error: 'Модель не вернула микро-биты' });
+      res.json({ beats });
+    } catch (err: any) {
+      console.error('generate-microbeats error:', err);
+      res.status(500).json({ error: err?.message || 'Micro-beats failed' });
+    }
+  });
+
   // "Разобрать сценарий": real extraction of recurring characters/locations
   // from the script text, replacing what was a setTimeout+fake-toast no-op.
   app.post('/api/parse-scene-elements', async (req, res) => {

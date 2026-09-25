@@ -86,6 +86,11 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const lastTickTimeRef = useRef<number | null>(null);
+  // Real narration audio player: the voice track's audioUrl plays here instead
+  // of the browser TTS. The single continuous clip that buildSynchronizedTimeline
+  // now emits when there's a real mp3 drives play/pause/seek.
+  const narrationAudioRef = useRef<HTMLAudioElement | null>(null);
+  const narrationClip = clips.find((c) => c.trackId === 'voice' && !!c.audioUrl);
 
   // Recalculate duration from clips
   useEffect(() => {
@@ -93,26 +98,52 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
     setTotalDuration(Math.max(24, Math.ceil(maxEnd)));
   }, [clips]);
 
-  // Audio start / stop when playing
+  // Audio start / stop when playing. If a real narration mp3 is on the voice
+  // track, we play IT (properly seeks and pauses with the transport). If not,
+  // fall back to per-scene browser TTS the way it worked before.
   useEffect(() => {
     if (isPlaying) {
       soundEngine.startBackgroundAmbience(duckingLevel);
-      // Speak current scene voiceover text if any
-      const currentVoiceClip = clips.find(
-        c => c.trackId === 'voice' && currentTime >= c.startTime && currentTime < c.startTime + c.duration
-      );
-      if (currentVoiceClip?.text && !isMuted) {
-        soundEngine.speakText(currentVoiceClip.text);
+      if (narrationClip?.audioUrl) {
+        const el = narrationAudioRef.current;
+        if (el && !isMuted) {
+          el.currentTime = Math.max(0, currentTime - narrationClip.startTime);
+          el.muted = isMuted;
+          el.play().catch(() => { /* browser might block autoplay until user gesture — user's play click IS the gesture */ });
+        }
+      } else {
+        const currentVoiceClip = clips.find(
+          c => c.trackId === 'voice' && currentTime >= c.startTime && currentTime < c.startTime + c.duration
+        );
+        if (currentVoiceClip?.text && !isMuted) {
+          soundEngine.speakText(currentVoiceClip.text);
+        }
       }
     } else {
       soundEngine.stopBackgroundAmbience();
       soundEngine.stopSpeech();
+      if (narrationAudioRef.current) narrationAudioRef.current.pause();
     }
     return () => {
       soundEngine.stopBackgroundAmbience();
       soundEngine.stopSpeech();
+      if (narrationAudioRef.current) narrationAudioRef.current.pause();
     };
   }, [isPlaying]);
+
+  // Keep the real narration audio's time in sync with the transport when the
+  // user scrubs or the tick loop advances currentTime (small drift correction).
+  useEffect(() => {
+    const el = narrationAudioRef.current;
+    if (!el || !narrationClip?.audioUrl) return;
+    const target = Math.max(0, currentTime - narrationClip.startTime);
+    if (Math.abs(el.currentTime - target) > 0.4) el.currentTime = target;
+  }, [currentTime, narrationClip?.audioUrl, narrationClip?.startTime]);
+
+  // Reflect mute toggle onto the real audio element.
+  useEffect(() => {
+    if (narrationAudioRef.current) narrationAudioRef.current.muted = isMuted;
+  }, [isMuted]);
 
   // Animation playback loop
   useEffect(() => {
@@ -242,13 +273,35 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
       project.scenes,
       aspectRatio,
       project.styleId || 'cinematic',
-      clipHoldDuration
+      clipHoldDuration,
+      project.narrationAudioUrl,
     );
     setClips(timelineClips);
     setTotalDuration(newTotalDuration);
     onUpdateProject({ timelineClips, duration: newTotalDuration });
     alert(`⚡ Автосборка завершена: ${project.scenes.length} кадров из Контент-завода синхронизированы с фразами озвучки!`);
   };
+
+  // If we entered Montage with an older timeline (no real-audio voice clip) but
+  // a real narration mp3 exists in the project, rebuild once so the transport
+  // gets a working audio track without waiting for a manual "Auto-sync" click.
+  useEffect(() => {
+    if (!project.narrationAudioUrl) return;
+    const hasAudioTrack = project.timelineClips?.some((c) => c.trackId === 'voice' && !!c.audioUrl);
+    if (hasAudioTrack) return;
+    const { timelineClips, totalDuration: newTotalDuration } = buildSynchronizedTimeline(
+      project.scenes,
+      aspectRatio,
+      project.styleId || 'cinematic',
+      clipHoldDuration,
+      project.narrationAudioUrl,
+    );
+    setClips(timelineClips);
+    setTotalDuration(newTotalDuration);
+    onUpdateProject({ timelineClips, duration: newTotalDuration });
+    // Intentionally one-shot: dependencies would loop through onUpdateProject.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project.narrationAudioUrl]);
 
   const handleShuffleLayout = () => {
     soundEngine.playWhoosh();
@@ -358,6 +411,11 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
 
   return (
     <div className="min-h-screen bg-[#0e0b08] text-stone-200 flex flex-col select-none">
+      {/* Hidden real-narration audio element: play/pause/seek is driven by the
+          transport above so the mp3 stays in lock-step with the timeline. */}
+      {narrationClip?.audioUrl && (
+        <audio ref={narrationAudioRef} src={narrationClip.audioUrl} preload="auto" style={{ display: 'none' }} />
+      )}
       {/* Top Header Bar */}
       <div className="border-b border-[#261d15] bg-[#130f0b] px-4 py-2 flex items-center justify-between text-xs">
         {/* Left: Back & Project name */}
