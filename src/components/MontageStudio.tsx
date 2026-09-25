@@ -729,16 +729,17 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
         </div>
 
         {/* Center Column: Video Preview Player (6 cols on lg) */}
-        <div className="col-span-12 md:col-span-6 bg-[#0a0806] flex flex-col justify-between p-4 relative">
-          {/* Canvas Viewport with Framing Box */}
-          <div className="flex-1 flex items-center justify-center relative min-h-[320px]">
-            <div 
+        <div className="col-span-12 md:col-span-6 bg-[#0a0806] flex flex-col justify-between p-3 relative">
+          {/* Canvas Viewport with Framing Box — shrank to fit 1080p laptops
+              without vertical scroll (was 620/380/500 max, ~25% smaller now). */}
+          <div className="flex-1 flex items-center justify-center relative min-h-[220px]">
+            <div
               className={`relative border-2 border-dashed border-[#57432b] rounded-lg overflow-hidden shadow-2xl transition-all ${
-                aspectRatio === '16:9' ? 'w-full max-w-[620px] aspect-video' :
-                aspectRatio === '9:16' ? 'h-full max-h-[380px] aspect-[9/16]' :
-                aspectRatio === '4:3' ? 'w-full max-w-[500px] aspect-[4/3]' :
-                aspectRatio === '3:4' ? 'h-full max-h-[380px] aspect-[3/4]' :
-                'w-full max-w-[380px] aspect-square'
+                aspectRatio === '16:9' ? 'w-full max-w-[460px] aspect-video' :
+                aspectRatio === '9:16' ? 'h-full max-h-[300px] aspect-[9/16]' :
+                aspectRatio === '4:3' ? 'w-full max-w-[380px] aspect-[4/3]' :
+                aspectRatio === '3:4' ? 'h-full max-h-[300px] aspect-[3/4]' :
+                'w-full max-w-[300px] aspect-square'
               }`}
             >
               <canvas
@@ -749,10 +750,11 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
                 onClick={() => setIsPlaying(!isPlaying)}
               />
 
-              {/* Safe guides watermark */}
+              {/* Safe guides watermark — shows the human aspect label, not the
+                  internal enum ("IMAGE_ASPECT_RATIO_LANDSCAPE" leak). */}
               <div className="absolute inset-4 pointer-events-none border border-amber-500/10 rounded flex items-center justify-center">
                 <span className="text-[10px] font-mono text-amber-500/40 uppercase tracking-widest">
-                  Безопасная зона · {getAspectRatioConfig(aspectRatio).code}
+                  Безопасная зона · {getAspectRatioConfig(aspectRatio).label}
                 </span>
               </div>
             </div>
