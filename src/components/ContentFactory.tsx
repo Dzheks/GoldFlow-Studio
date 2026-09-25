@@ -15,7 +15,7 @@ import { AutomatedPipelineRunner } from './AutomatedPipelineRunner';
 import { compileNineFieldsPrompt, DirectorNineFields } from '../types/goldflow';
 import { ELEVEN_LANGUAGES } from '../types/languages';
 import { generateGoldflowPipeline } from '../utils/goldflowPipeline';
-import { generateScriptReal, generateImageReal, parseSceneElementsReal, synthesizeVoiceReal, GeneratedBlock, GeneratedHero } from '../services/geminiPipelineClient';
+import { generateScriptReal, generateImageReal, parseSceneElementsReal, synthesizeVoiceReal, transcribeVoiceReal, GeneratedBlock, GeneratedHero } from '../services/geminiPipelineClient';
 import { 
   generateSmartScript, 
   parseScriptToPromptLines, 
@@ -93,7 +93,8 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
   onDeductCredits,
 }) => {
   const [selectedStyleId, setSelectedStyleId] = useState<string>(project.styleId);
-  const [scriptTab, setScriptTab] = useState<'generate' | 'custom'>('generate');
+  const [scriptTab, setScriptTab] = useState<'generate' | 'custom' | 'upload'>('generate');
+  const [uploadedAudio, setUploadedAudio] = useState<{ base64: string; mimeType: string; name: string; objectUrl: string } | null>(null);
   const [targetSeconds, setTargetSeconds] = useState<number>(60);
   const [customMin, setCustomMin] = useState<number>(1);
   const [customSec, setCustomSec] = useState<number>(0);
@@ -274,10 +275,35 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
       showToast('Сначала введи тему ролика');
       return;
     }
+    if (scriptTab === 'upload' && !uploadedAudio) {
+      showToast('Сначала загрузи аудиофайл озвучки');
+      return;
+    }
 
     setIsGeneratingScript(true);
     setScriptBatchProgress(null);
     try {
+      // Upload mode: transcribe the user's own voiceover first, then treat the
+      // transcript exactly like pasted custom text. The clip's real duration
+      // (measured server-side) drives shot timing instead of Lumean synthesis.
+      let uploadedDurationMs = 0;
+      let linesForRun = customScriptLines;
+      if (scriptTab === 'upload' && uploadedAudio) {
+        showToast('🎧 Расшифровываю загруженную озвучку…');
+        const tr = await transcribeVoiceReal({
+          audioBase64: uploadedAudio.base64,
+          mimeType: uploadedAudio.mimeType,
+          language: scriptLanguage,
+        });
+        if (tr.error || !tr.text) {
+          showToast(`❌ Не удалось расшифровать аудио (${tr.error || 'пустой ответ'})`);
+          setIsGeneratingScript(false);
+          return;
+        }
+        uploadedDurationMs = tr.durationMs || 0;
+        linesForRun = splitScriptIntoSentenceLines(tr.text);
+        showToast(`📝 Расшифровано: ${linesForRun.length} предложений${uploadedDurationMs ? `, длина аудио ${Math.round(uploadedDurationMs / 1000)} сек` : ''}.`);
+      }
       // A single structured-output call reliably handles ~20-25 detailed
       // blocks (full 9-field director prompts each) — past that it gets
       // slow/unreliable (documented: 60 blocks didn't finish in 120s). A
@@ -286,11 +312,12 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
       // the same hero name across batches so the character doesn't change
       // partway through.
       const CUSTOM_BATCH_SIZE = 20;
-      const res = scriptTab === 'custom'
+      const isLineDriven = scriptTab === 'custom' || scriptTab === 'upload';
+      const res = isLineDriven
         ? await (async () => {
             const batches: string[][] = [];
-            for (let i = 0; i < customScriptLines.length; i += CUSTOM_BATCH_SIZE) {
-              batches.push(customScriptLines.slice(i, i + CUSTOM_BATCH_SIZE));
+            for (let i = 0; i < linesForRun.length; i += CUSTOM_BATCH_SIZE) {
+              batches.push(linesForRun.slice(i, i + CUSTOM_BATCH_SIZE));
             }
             const allBlocks: GeneratedBlock[] = [];
             let sharedHero: GeneratedHero | undefined;
@@ -331,9 +358,9 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
       }
 
       if (res.isSimulated || !res.blocks?.length || !res.heroMaster) {
-        if (scriptTab === 'custom') {
-          // Custom mode has no honest offline fallback — the whole point is
-          // running the user's exact text through real AI framing, not a
+        if (isLineDriven) {
+          // Custom/upload mode has no honest offline fallback — the whole point
+          // is running the user's exact text through real AI framing, not a
           // template. Fail loudly instead of pretending it worked.
           showToast(`❌ Не удалось разобрать текст на кадры (${res.error || 'нет ключа/сессии'})`);
           return;
@@ -395,46 +422,47 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
       }));
 
       setHeroName(res.heroMaster.name);
-      showToast(`✨ Сценарий готов (реально через Gemini): создано ${generatedPrompts.length} промптов под кадры! Синтезируем озвучку для точного тайминга...`);
 
-      // Real TTS via Lumean — replaces estimated durations (chars/13.5) with
-      // the ACTUAL spoken duration of each line, from its real subtitles.srt
-      // cue (one cue per sentence, matching one scene each). "Монтаж по
-      // словам озвучки" only means anything with real audio backing it.
+      // Establish the real narration audio + its true wall-clock length, then
+      // anchor the whole video to it. Upload mode already HAS the user's audio;
+      // custom/generate modes synthesize it via Lumean.
       let narrationAudioUrl: string | undefined;
+      let realTotalSec = 0;
       try {
-        const voiceRes = await synthesizeVoiceReal({ text: fullScript, langCode: scriptLanguage });
-        if (voiceRes.audioUrl) {
-          narrationAudioUrl = voiceRes.audioUrl;
-          const cues = voiceRes.cues || [];
-          // Real total spoken length, most-trustworthy source first: the actual
-          // mp3's own duration, then Lumean's reported durationMs, then the last
-          // SRT cue's end. This is the number the whole video MUST match.
-          const measuredSec = await measureAudioDurationSec(voiceRes.audioUrl);
-          const durationMsSec = voiceRes.durationMs ? voiceRes.durationMs / 1000 : 0;
-          const lastCueSec = cues.length ? cues[cues.length - 1].endSec : 0;
-          const realTotalSec = measuredSec || durationMsSec || lastCueSec;
-          const srcLabel = measuredSec ? 'mp3' : durationMsSec ? 'durationMs' : lastCueSec ? 'cue' : 'нет';
-          // One diagnostic toast so a single run tells the whole story: which
-          // duration source won, its value, cue/block counts, estimate sum.
-          const estSum = Math.round(newScenes.reduce((a, s) => a + s.duration, 0));
-          showToast(`🔎 Аудио: mp3=${Math.round(measuredSec)}с, durationMs=${Math.round(durationMsSec)}с, cues=${cues.length}, блоков=${newScenes.length}, оценка=${estSum}с → взято ${srcLabel}=${Math.round(realTotalSec)}с`);
-
-          if (realTotalSec > 0) {
-            // Always anchor the WHOLE video to the real wall-clock audio length
-            // (which includes [pause] silences). Distribute it across blocks by
-            // text weight. The old "1 cue per block" path summed per-cue spoken
-            // durations, which excludes the gaps between cues and undershot the
-            // real length badly (e.g. 340s of speech inside a 693s file).
-            const weights = newScenes.map((s) => Math.max(1, (s.description || '').length));
-            const weightSum = weights.reduce((a, b) => a + b, 0);
-            newScenes.forEach((s, idx) => {
-              s.duration = Number(((weights[idx] / weightSum) * realTotalSec).toFixed(2));
-            });
-            showToast(`🎙️ Озвучка синтезирована (${Math.round(realTotalSec)} сек) — тайминг кадров подогнан под реальную длину аудио.`);
+        if (scriptTab === 'upload' && uploadedAudio) {
+          narrationAudioUrl = uploadedAudio.objectUrl;
+          // Prefer the browser's own reading of the local file; fall back to the
+          // server-measured duration from the upload.
+          const measuredSec = await measureAudioDurationSec(uploadedAudio.objectUrl);
+          realTotalSec = measuredSec || (uploadedDurationMs ? uploadedDurationMs / 1000 : 0);
+          showToast(`🎧 Ваша озвучка подключена (${Math.round(realTotalSec)} сек) — тайминг кадров подогнан под неё.`);
+        } else {
+          showToast(`✨ Сценарий готов: ${generatedPrompts.length} промптов! Синтезирую озвучку для точного тайминга...`);
+          const voiceRes = await synthesizeVoiceReal({ text: fullScript, langCode: scriptLanguage });
+          if (voiceRes.audioUrl) {
+            narrationAudioUrl = voiceRes.audioUrl;
+            const cues = voiceRes.cues || [];
+            const measuredSec = await measureAudioDurationSec(voiceRes.audioUrl);
+            const durationMsSec = voiceRes.durationMs ? voiceRes.durationMs / 1000 : 0;
+            const lastCueSec = cues.length ? cues[cues.length - 1].endSec : 0;
+            realTotalSec = measuredSec || durationMsSec || lastCueSec;
+            const srcLabel = measuredSec ? 'mp3' : durationMsSec ? 'durationMs' : lastCueSec ? 'cue' : 'нет';
+            const estSum = Math.round(newScenes.reduce((a, s) => a + s.duration, 0));
+            showToast(`🔎 Аудио: mp3=${Math.round(measuredSec)}с, durationMs=${Math.round(durationMsSec)}с, cues=${cues.length}, блоков=${newScenes.length}, оценка=${estSum}с → взято ${srcLabel}=${Math.round(realTotalSec)}с`);
+            if (realTotalSec > 0) showToast(`🎙️ Озвучка синтезирована (${Math.round(realTotalSec)} сек) — тайминг подогнан под реальную длину аудио.`);
+          } else if (voiceRes.error) {
+            showToast(`⚠️ Озвучка не удалась (${voiceRes.error}) — тайминг остался оценочным по длине текста.`);
           }
-        } else if (voiceRes.error) {
-          showToast(`⚠️ Озвучка не удалась (${voiceRes.error}) — тайминг остался оценочным по длине текста.`);
+        }
+
+        // Anchor the WHOLE video to the real wall-clock audio length (incl.
+        // pauses), distributed across blocks by text weight.
+        if (realTotalSec > 0) {
+          const weights = newScenes.map((s) => Math.max(1, (s.description || '').length));
+          const weightSum = weights.reduce((a, b) => a + b, 0);
+          newScenes.forEach((s, idx) => {
+            s.duration = Number(((weights[idx] / weightSum) * realTotalSec).toFixed(2));
+          });
         }
       } catch (err: any) {
         showToast(`⚠️ Озвучка не удалась (${err?.message || 'ошибка'}) — тайминг остался оценочным.`);
@@ -1039,6 +1067,8 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
                 <span className="text-[11px] text-stone-500 font-mono">
                   {scriptTab === 'custom'
                     ? `${customScriptLines.length} сцены из текста`
+                    : scriptTab === 'upload'
+                    ? (uploadedAudio ? 'аудио загружено' : 'аудио не выбрано')
                     : `${estimatedSceneCount} сцен по ${SECONDS_PER_SCENE} с`}
                 </span>
               </div>
@@ -1065,6 +1095,16 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
                     }`}
                   >
                     У меня свой текст
+                  </button>
+                  <button
+                    onClick={() => setScriptTab('upload')}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                      scriptTab === 'upload'
+                        ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                        : 'bg-[#1a130e] text-stone-400 hover:text-white border border-[#2e2216]'
+                    }`}
+                  >
+                    Загрузить свою озвучку
                   </button>
                 </div>
 
@@ -1175,7 +1215,7 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
                     Сценарист пишет текст под выбранный хронометраж — количество сцен и таймкоды считаются от него (~{SECONDS_PER_SCENE} сек на сцену). Промпты появятся ниже, их можно править перед запуском.
                   </p>
                 </>
-              ) : (
+              ) : scriptTab === 'custom' ? (
                 <>
                   {/* Textarea — custom mode: the pasted text goes into the video verbatim */}
                   <textarea
@@ -1234,6 +1274,88 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
                         <>
                           <Sparkles className="w-3.5 h-3.5" />
                           <span>Написать сценарий</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  {/* Upload mode: user's own voiceover → transcribe → same pipeline */}
+                  <label className="block cursor-pointer">
+                    <div className="w-full bg-[#1a130e] border border-dashed border-[#3a2c1c] hover:border-amber-500/60 rounded-xl p-6 text-center transition-colors">
+                      <input
+                        type="file"
+                        accept="audio/*"
+                        className="hidden"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (!file) return;
+                          const reader = new FileReader();
+                          reader.onload = () => {
+                            const dataUrl = String(reader.result || '');
+                            const base64 = dataUrl.replace(/^data:[^;]+;base64,/, '');
+                            if (uploadedAudio?.objectUrl) URL.revokeObjectURL(uploadedAudio.objectUrl);
+                            setUploadedAudio({
+                              base64,
+                              mimeType: file.type || 'audio/mpeg',
+                              name: file.name,
+                              objectUrl: URL.createObjectURL(file),
+                            });
+                          };
+                          reader.readAsDataURL(file);
+                        }}
+                      />
+                      {uploadedAudio ? (
+                        <div className="space-y-2">
+                          <p className="text-sm text-emerald-300 font-mono">🎧 {uploadedAudio.name}</p>
+                          <audio controls src={uploadedAudio.objectUrl} className="mx-auto w-full max-w-md" />
+                          <p className="text-[11px] text-stone-500">Нажми, чтобы выбрать другой файл</p>
+                        </div>
+                      ) : (
+                        <div className="space-y-1">
+                          <p className="text-sm text-stone-300 font-mono">Загрузи свою озвучку (mp3, wav, m4a)</p>
+                          <p className="text-[11px] text-stone-500">ИИ сам расшифрует речь, напишет по ней сценарий и соберёт промпты кадров — тайминг возьмётся из реальной длины твоего аудио.</p>
+                        </div>
+                      )}
+                    </div>
+                  </label>
+
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-mono uppercase text-stone-400">Язык озвучки:</span>
+                    <select
+                      value={scriptLanguage}
+                      onChange={(e) => setScriptLanguage(e.target.value)}
+                      className="bg-[#1a130e] border border-[#2e2217] rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none"
+                    >
+                      {ELEVEN_LANGUAGES.map((l) => (
+                        <option key={l.id} value={l.id}>по-{l.nativeName.toLowerCase()}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-between gap-4 pt-2">
+                    <span className="text-[11px] text-stone-500 font-mono">
+                      {uploadedAudio ? 'Аудио готово — жми, и ИИ расшифрует его и соберёт кадры под реальный хронометраж.' : 'Сначала выбери аудиофайл выше.'}
+                    </span>
+                    <button
+                      onClick={handleGenerateScript}
+                      disabled={isGeneratingScript || !uploadedAudio}
+                      className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-amber-500 to-yellow-400 hover:from-amber-400 hover:to-yellow-300 text-black font-semibold text-xs transition-all shadow-md flex items-center gap-2 disabled:opacity-50"
+                    >
+                      {isGeneratingScript ? (
+                        <>
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                          <span>
+                            {scriptBatchProgress
+                              ? `Сегмент ${scriptBatchProgress.current} из ${scriptBatchProgress.total}... ${scriptGenElapsed}с`
+                              : `Расшифровка и разбор... ${scriptGenElapsed}с`}
+                          </span>
+                        </>
+                      ) : (
+                        <>
+                          <Sparkles className="w-3.5 h-3.5" />
+                          <span>Расшифровать и собрать сценарий</span>
                         </>
                       )}
                     </button>

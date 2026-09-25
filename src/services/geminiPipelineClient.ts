@@ -151,6 +151,33 @@ export async function synthesizeVoiceReal(payload: {
   }
 }
 
+export interface TranscribeVoiceResult {
+  text?: string;
+  durationMs?: number | null;
+  error?: string;
+}
+
+export async function transcribeVoiceReal(payload: {
+  audioBase64: string;
+  mimeType?: string;
+  language?: string;
+}): Promise<TranscribeVoiceResult> {
+  try {
+    const res = await fetch('/api/transcribe-voice', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      return { error: data?.error || 'Ошибка расшифровки' };
+    }
+    return data;
+  } catch (err: any) {
+    return { error: err?.message || 'Сервер недоступен' };
+  }
+}
+
 export interface GenerateVideoStartResult {
   operationName?: string;
   model?: string;

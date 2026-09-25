@@ -277,31 +277,32 @@ async function startServer() {
   // per-cue SRT sums (which exclude the gaps between cues). For a CBR file
   // duration = fileBytes * 8 / bitrate; the bitrate/samplerate come from the
   // first MPEG audio frame header. Returns ms, or 0 if it can't be determined.
+  function mp3DurationMsFromBuffer(buf: Buffer): number {
+    const size = buf.length;
+    // Find first frame sync (0xFFEx) past any ID3v2 tag.
+    let off = 0;
+    if (buf.slice(0, 3).toString('latin1') === 'ID3') {
+      const tagSize = ((buf[6] & 0x7f) << 21) | ((buf[7] & 0x7f) << 14) | ((buf[8] & 0x7f) << 7) | (buf[9] & 0x7f);
+      off = 10 + tagSize;
+    }
+    const V1L3_BITRATES = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
+    for (let i = off; i < Math.min(size - 4, off + 8192); i++) {
+      if (buf[i] !== 0xff || (buf[i + 1] & 0xe0) !== 0xe0) continue;
+      const bIdx = (buf[i + 2] >> 4) & 0x0f;
+      const sIdx = (buf[i + 2] >> 2) & 0x03;
+      if (bIdx === 0 || bIdx === 15 || sIdx === 3) continue;
+      const bitrate = V1L3_BITRATES[bIdx] * 1000;
+      if (!bitrate) continue;
+      return Math.round(((size - off) * 8) / bitrate * 1000);
+    }
+    return 0;
+  }
+
   async function measureMp3DurationMs(url: string): Promise<number> {
     try {
       const resp = await fetch(url);
       if (!resp.ok) return 0;
-      const buf = Buffer.from(await resp.arrayBuffer());
-      const size = buf.length;
-      // Find first frame sync (0xFFEx) past any ID3v2 tag.
-      let off = 0;
-      if (buf.slice(0, 3).toString('latin1') === 'ID3') {
-        const tagSize = ((buf[6] & 0x7f) << 21) | ((buf[7] & 0x7f) << 14) | ((buf[8] & 0x7f) << 7) | (buf[9] & 0x7f);
-        off = 10 + tagSize;
-      }
-      const V1L3_BITRATES = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
-      const SAMPLE_RATES = [44100, 48000, 32000];
-      for (let i = off; i < Math.min(size - 4, off + 8192); i++) {
-        if (buf[i] !== 0xff || (buf[i + 1] & 0xe0) !== 0xe0) continue;
-        const bIdx = (buf[i + 2] >> 4) & 0x0f;
-        const sIdx = (buf[i + 2] >> 2) & 0x03;
-        if (bIdx === 0 || bIdx === 15 || sIdx === 3) continue;
-        const bitrate = V1L3_BITRATES[bIdx] * 1000;
-        if (!bitrate) continue;
-        // Data length excludes the header offset for a closer estimate.
-        return Math.round(((size - off) * 8) / bitrate * 1000);
-      }
-      return 0;
+      return mp3DurationMsFromBuffer(Buffer.from(await resp.arrayBuffer()));
     } catch {
       return 0;
     }
@@ -359,6 +360,51 @@ async function startServer() {
     } catch (err: any) {
       console.error('synthesize-voice error:', err);
       res.status(500).json({ error: err?.message || 'Voice synthesis failed' });
+    }
+  });
+
+  // Transcribe a user-uploaded voiceover into verbatim text via Gemini, and
+  // measure the clip's real wall-clock length. The transcript then feeds the
+  // same custom-script pipeline (blocks/hero/nineFields), and the measured
+  // duration drives shot timing/splitting exactly like synthesized audio.
+  app.post('/api/transcribe-voice', async (req, res) => {
+    try {
+      const { audioBase64, mimeType, language } = req.body || {};
+      if (!apiKey) {
+        return res.status(503).json({ error: 'GEMINI_API_KEY не настроен в окружении' });
+      }
+      if (!audioBase64 || !String(audioBase64).trim()) {
+        return res.status(400).json({ error: 'Пустой аудиофайл' });
+      }
+      const rawBase64 = String(audioBase64).replace(/^data:[^;]+;base64,/, '');
+      const langName = language === 'en' ? 'английском' : 'русском';
+
+      const result: any = await ai.models.generateContent({
+        model: TEXT_MODEL,
+        contents: [{
+          role: 'user',
+          parts: [
+            { text: `Точно и дословно расшифруй речь из этого аудио в текст на ${langName} языке. Верни ТОЛЬКО сам текст расшифровки, без комментариев, без таймкодов, без ярлыков диктора. Сохрани естественную пунктуацию и деление на предложения.` },
+            { inlineData: { mimeType: mimeType || 'audio/mpeg', data: rawBase64 } },
+          ],
+        }],
+      });
+
+      const text = (result.text || '').trim();
+      if (!text) {
+        return res.status(502).json({ error: 'Модель не вернула расшифровку' });
+      }
+
+      let durationMs = 0;
+      try {
+        const buf = Buffer.from(rawBase64, 'base64');
+        durationMs = mp3DurationMsFromBuffer(buf);
+      } catch { /* non-fatal — client measures the clip too */ }
+
+      res.json({ text, durationMs: durationMs || null });
+    } catch (err: any) {
+      console.error('transcribe-voice error:', err);
+      res.status(500).json({ error: err?.message || 'Transcription failed' });
     }
   });
 
