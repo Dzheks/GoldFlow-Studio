@@ -2139,10 +2139,60 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
                     <button
                       type="button"
                       onClick={() => setIsHeroPreviewOpen(true)}
-                      className="shrink-0 underline hover:text-emerald-200"
+                      className="shrink-0 underline text-emerald-300 hover:text-emerald-200"
                     >
                       Посмотреть
                     </button>
+                    <label className="ml-auto shrink-0 underline text-emerald-300 hover:text-emerald-200 cursor-pointer">
+                      Заменить своим фото
+                      <input
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (!file) return;
+                          const reader = new FileReader();
+                          reader.onload = () => {
+                            const dataUrl = String(reader.result || '');
+                            const base64 = dataUrl.replace(/^data:[^;]+;base64,/, '');
+                            const img = { base64, mimeType: file.type || 'image/jpeg' };
+                            setHeroRefImage(img);
+                            onUpdateProject({ heroRefImage: img });
+                            showToast('👤 Эталон героя заменён твоим фото — этот же портрет пойдёт референсом во все кадры.');
+                          };
+                          reader.readAsDataURL(file);
+                        }}
+                      />
+                    </label>
+                  </div>
+                )}
+                {!heroRefImage && (
+                  <div className="flex flex-wrap items-center gap-2 px-3 py-2 rounded-xl bg-emerald-950/10 border border-emerald-500/20 text-[11px] font-mono text-emerald-300/80">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <span>Нет эталона героя — хочешь подставить своё фото вместо ИИ-портрета?</span>
+                      <span className="px-2 py-1 rounded bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/40 text-emerald-200">Загрузить фото героя</span>
+                      <input
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (!file) return;
+                          const reader = new FileReader();
+                          reader.onload = () => {
+                            const dataUrl = String(reader.result || '');
+                            const base64 = dataUrl.replace(/^data:[^;]+;base64,/, '');
+                            const img = { base64, mimeType: file.type || 'image/jpeg' };
+                            setHeroRefImage(img);
+                            onUpdateProject({ heroRefImage: img, heroName: heroName || 'Герой' });
+                            if (!heroName) setHeroName('Герой');
+                            showToast('👤 Эталон героя подключён из твоего фото.');
+                          };
+                          reader.readAsDataURL(file);
+                        }}
+                      />
+                    </label>
                   </div>
                 )}
 
