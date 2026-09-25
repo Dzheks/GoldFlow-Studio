@@ -272,6 +272,41 @@ async function startServer() {
     });
   }
 
+  // Authoritative wall-clock length of the generated mp3 (including [pause]
+  // silences), independent of Lumean's total_duration_ms (often null) and of
+  // per-cue SRT sums (which exclude the gaps between cues). For a CBR file
+  // duration = fileBytes * 8 / bitrate; the bitrate/samplerate come from the
+  // first MPEG audio frame header. Returns ms, or 0 if it can't be determined.
+  async function measureMp3DurationMs(url: string): Promise<number> {
+    try {
+      const resp = await fetch(url);
+      if (!resp.ok) return 0;
+      const buf = Buffer.from(await resp.arrayBuffer());
+      const size = buf.length;
+      // Find first frame sync (0xFFEx) past any ID3v2 tag.
+      let off = 0;
+      if (buf.slice(0, 3).toString('latin1') === 'ID3') {
+        const tagSize = ((buf[6] & 0x7f) << 21) | ((buf[7] & 0x7f) << 14) | ((buf[8] & 0x7f) << 7) | (buf[9] & 0x7f);
+        off = 10 + tagSize;
+      }
+      const V1L3_BITRATES = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
+      const SAMPLE_RATES = [44100, 48000, 32000];
+      for (let i = off; i < Math.min(size - 4, off + 8192); i++) {
+        if (buf[i] !== 0xff || (buf[i + 1] & 0xe0) !== 0xe0) continue;
+        const bIdx = (buf[i + 2] >> 4) & 0x0f;
+        const sIdx = (buf[i + 2] >> 2) & 0x03;
+        if (bIdx === 0 || bIdx === 15 || sIdx === 3) continue;
+        const bitrate = V1L3_BITRATES[bIdx] * 1000;
+        if (!bitrate) continue;
+        // Data length excludes the header offset for a closer estimate.
+        return Math.round(((size - off) * 8) / bitrate * 1000);
+      }
+      return 0;
+    } catch {
+      return 0;
+    }
+  }
+
   app.post('/api/synthesize-voice', async (req, res) => {
     try {
       const { text, voiceId, langCode } = req.body || {};
@@ -312,9 +347,13 @@ async function startServer() {
         cues = parseSrt(srtText);
       }
 
+      // Prefer Lumean's own number when present; otherwise measure the real
+      // wall-clock length from the mp3 so the client can match the video to it.
+      const measuredMs = completed.total_duration_ms || (await measureMp3DurationMs(audioUrlData.url));
+
       res.json({
         audioUrl: audioUrlData.url,
-        durationMs: completed.total_duration_ms || null,
+        durationMs: measuredMs || null,
         cues,
       });
     } catch (err: any) {

@@ -420,17 +420,12 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
           const estSum = Math.round(newScenes.reduce((a, s) => a + s.duration, 0));
           showToast(`🔎 Аудио: mp3=${Math.round(measuredSec)}с, durationMs=${Math.round(durationMsSec)}с, cues=${cues.length}, блоков=${newScenes.length}, оценка=${estSum}с → взято ${srcLabel}=${Math.round(realTotalSec)}с`);
 
-          if (cues.length === newScenes.length) {
-            // Ideal: one cue per block — use each cue's real duration directly.
-            cues.forEach((cue, idx) => {
-              newScenes[idx].duration = Number((cue.endSec - cue.startSec).toFixed(2));
-            });
-            showToast('🎙️ Реальная озвучка синтезирована — тайминг кадров взят из настоящих таймкодов Lumean (1:1).');
-          } else if (realTotalSec > 0) {
-            // Cue count ≠ block count (Lumean splits by sentence, AI groups by
-            // scene). The char-estimate sum badly undershoots real audio, so
-            // scale every block so the TOTAL equals the real narration length,
-            // weighting by each block's text length (longer line = more time).
+          if (realTotalSec > 0) {
+            // Always anchor the WHOLE video to the real wall-clock audio length
+            // (which includes [pause] silences). Distribute it across blocks by
+            // text weight. The old "1 cue per block" path summed per-cue spoken
+            // durations, which excludes the gaps between cues and undershot the
+            // real length badly (e.g. 340s of speech inside a 693s file).
             const weights = newScenes.map((s) => Math.max(1, (s.description || '').length));
             const weightSum = weights.reduce((a, b) => a + b, 0);
             newScenes.forEach((s, idx) => {
@@ -453,7 +448,9 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
       // nineFields/hero/location but vary the camera angle, so runtime actually
       // drives shot count (693 sec → ~170+ shots, not 14).
       const TARGET_SHOT_SECONDS = 4;
-      const MAX_SUBSHOTS = 12;
+      // High enough that shot count is driven by real duration (total/4), not
+      // clipped — a long block (few-block script) still splits down to ~4s.
+      const MAX_SUBSHOTS = 40;
       const CAMERA_ANGLES = [
         'wide establishing shot', 'medium shot', 'close-up detail shot',
         'over-the-shoulder angle', 'low-angle dramatic shot', 'high-angle overview',
