@@ -164,6 +164,7 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
     (project.aspectRatio as AspectRatioKey) || '16:9'
   );
   const [previewScene, setPreviewScene] = useState<StoryScene | null>(null);
+  const [isHeroPreviewOpen, setIsHeroPreviewOpen] = useState<boolean>(false);
   const [regeneratingSceneId, setRegeneratingSceneId] = useState<number | null>(null);
   const [isZippingFrames, setIsZippingFrames] = useState<boolean>(false);
   const [justGenerated, setJustGenerated] = useState<boolean>(false);
@@ -1995,8 +1996,21 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
               <div className="space-y-2">
                 {heroRefImage && (
                   <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-emerald-950/20 border border-emerald-500/30 text-[11px] font-mono text-emerald-300">
-                    <img src={`data:${heroRefImage.mimeType};base64,${heroRefImage.base64}`} alt="hero" className="w-6 h-6 rounded object-cover border border-emerald-500/40" />
+                    <img
+                      src={`data:${heroRefImage.mimeType};base64,${heroRefImage.base64}`}
+                      alt="hero"
+                      onClick={() => setIsHeroPreviewOpen(true)}
+                      className="w-6 h-6 rounded object-cover border border-emerald-500/40 cursor-pointer hover:ring-2 hover:ring-emerald-400/60 transition-all shrink-0"
+                      title="Посмотреть эталон героя в полном размере"
+                    />
                     <span>Эталон героя «{heroName}» подключён — каждый кадр пачки получит его как референс для консистентности.</span>
+                    <button
+                      type="button"
+                      onClick={() => setIsHeroPreviewOpen(true)}
+                      className="ml-auto shrink-0 underline text-emerald-300 hover:text-emerald-200"
+                    >
+                      Посмотреть
+                    </button>
                   </div>
                 )}
                 <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-xl bg-[#120d09] border border-[#261a10] text-[11px] font-mono text-stone-400">
@@ -2387,6 +2401,39 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
           heroName={project.characters[0]?.name || 'Главный герой'}
           onSave={handleSaveNineFields}
         />
+      )}
+
+      {/* Hero Reference Preview Modal */}
+      {isHeroPreviewOpen && heroRefImage && (
+        <div
+          className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex items-center justify-center p-4 animate-in fade-in duration-200"
+          onClick={() => setIsHeroPreviewOpen(false)}
+        >
+          <div
+            className="bg-[#16100c] border border-[#3b2b1d] rounded-2xl max-w-xl w-full overflow-hidden shadow-2xl space-y-3 p-5"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-[#2e2115] pb-3">
+              <h4 className="font-bold text-white text-sm">Эталон героя «{heroName}»</h4>
+              <button
+                onClick={() => setIsHeroPreviewOpen(false)}
+                className="w-7 h-7 rounded-full bg-[#261c13] hover:bg-[#382a1d] text-stone-300 flex items-center justify-center text-xs"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="relative rounded-xl overflow-hidden bg-black aspect-square max-h-[420px] flex items-center justify-center border border-[#2d2015]">
+              <img
+                src={`data:${heroRefImage.mimeType};base64,${heroRefImage.base64}`}
+                alt={`Эталон героя ${heroName}`}
+                className="w-full h-full object-contain"
+              />
+            </div>
+            <p className="text-[11px] text-stone-500 leading-relaxed">
+              Этот портрет передаётся как референс лица/внешности в каждый кадр пачки — так герой остаётся одним и тем же человеком от кадра к кадру.
+            </p>
+          </div>
+        </div>
       )}
 
       {/* Frame Preview Modal */}
