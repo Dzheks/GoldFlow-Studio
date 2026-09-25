@@ -15,7 +15,7 @@ import { AutomatedPipelineRunner } from './AutomatedPipelineRunner';
 import { compileNineFieldsPrompt, DirectorNineFields } from '../types/goldflow';
 import { ELEVEN_LANGUAGES } from '../types/languages';
 import { generateGoldflowPipeline } from '../utils/goldflowPipeline';
-import { generateScriptReal, generateImageReal, parseSceneElementsReal, synthesizeVoiceReal, GeneratedBlock, GeneratedHero } from '../services/geminiPipelineClient';
+import { generateScriptReal, generateImageReal, parseSceneElementsReal, synthesizeVoiceReal, transcribeVoiceReal, GeneratedBlock, GeneratedHero } from '../services/geminiPipelineClient';
 import { 
   generateSmartScript, 
   parseScriptToPromptLines, 
@@ -93,7 +93,11 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
   onDeductCredits,
 }) => {
   const [selectedStyleId, setSelectedStyleId] = useState<string>(project.styleId);
-  const [scriptTab, setScriptTab] = useState<'generate' | 'custom'>('generate');
+  const [scriptTab, setScriptTab] = useState<'generate' | 'custom' | 'upload' | 'lumean'>('generate');
+  const [uploadedAudio, setUploadedAudio] = useState<{ base64: string; mimeType: string; name: string; objectUrl: string } | null>(null);
+  const [lumeanText, setLumeanText] = useState<string>('');
+  const [lumeanResult, setLumeanResult] = useState<import('../services/geminiPipelineClient').SynthesizeVoiceResult | null>(null);
+  const [isSynthesizing, setIsSynthesizing] = useState<boolean>(false);
   const [targetSeconds, setTargetSeconds] = useState<number>(60);
   const [customMin, setCustomMin] = useState<number>(1);
   const [customSec, setCustomSec] = useState<number>(0);
@@ -274,10 +278,35 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
       showToast('Сначала введи тему ролика');
       return;
     }
+    if (scriptTab === 'upload' && !uploadedAudio) {
+      showToast('Сначала загрузи аудиофайл озвучки');
+      return;
+    }
 
     setIsGeneratingScript(true);
     setScriptBatchProgress(null);
     try {
+      // Upload mode: transcribe the user's own voiceover first, then treat the
+      // transcript exactly like pasted custom text. The clip's real duration
+      // (measured server-side) drives shot timing instead of Lumean synthesis.
+      let uploadedDurationMs = 0;
+      let linesForRun = customScriptLines;
+      if (scriptTab === 'upload' && uploadedAudio) {
+        showToast('🎧 Расшифровываю загруженную озвучку…');
+        const tr = await transcribeVoiceReal({
+          audioBase64: uploadedAudio.base64,
+          mimeType: uploadedAudio.mimeType,
+          language: scriptLanguage,
+        });
+        if (tr.error || !tr.text) {
+          showToast(`❌ Не удалось расшифровать аудио (${tr.error || 'пустой ответ'})`);
+          setIsGeneratingScript(false);
+          return;
+        }
+        uploadedDurationMs = tr.durationMs || 0;
+        linesForRun = splitScriptIntoSentenceLines(tr.text);
+        showToast(`📝 Расшифровано: ${linesForRun.length} предложений${uploadedDurationMs ? `, длина аудио ${Math.round(uploadedDurationMs / 1000)} сек` : ''}.`);
+      }
       // A single structured-output call reliably handles ~20-25 detailed
       // blocks (full 9-field director prompts each) — past that it gets
       // slow/unreliable (documented: 60 blocks didn't finish in 120s). A
@@ -286,15 +315,24 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
       // the same hero name across batches so the character doesn't change
       // partway through.
       const CUSTOM_BATCH_SIZE = 20;
-      const res = scriptTab === 'custom'
+      const isLineDriven = scriptTab === 'custom' || scriptTab === 'upload';
+      const res = isLineDriven
         ? await (async () => {
-            // Batch by whole paragraphs, never mid-paragraph — the director
-            // AI needs a complete thought to genuinely decide frame count
-            // from content, not an arbitrary line-count slice.
-            const batches: string[][] = groupParagraphsIntoBatches(
-              splitScriptIntoParagraphGroups(customScriptText),
-              CUSTOM_BATCH_SIZE
-            );
+            // Pasted text ('custom') batches by whole paragraphs, never
+            // mid-paragraph — the director AI needs a complete thought to
+            // genuinely decide frame count from content, not an arbitrary
+            // line-count slice. A transcript ('upload') has no real
+            // paragraph structure to preserve, so it just batches the flat
+            // sentence list linesForRun already produced.
+            const batches: string[][] = scriptTab === 'custom'
+              ? groupParagraphsIntoBatches(splitScriptIntoParagraphGroups(customScriptText), CUSTOM_BATCH_SIZE)
+              : (() => {
+                  const flat: string[][] = [];
+                  for (let i = 0; i < linesForRun.length; i += CUSTOM_BATCH_SIZE) {
+                    flat.push(linesForRun.slice(i, i + CUSTOM_BATCH_SIZE));
+                  }
+                  return flat;
+                })();
             const allBlocks: GeneratedBlock[] = [];
             let sharedHero: GeneratedHero | undefined;
             for (let b = 0; b < batches.length; b++) {
@@ -334,9 +372,9 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
       }
 
       if (res.isSimulated || !res.blocks?.length || !res.heroMaster) {
-        if (scriptTab === 'custom') {
-          // Custom mode has no honest offline fallback — the whole point is
-          // running the user's exact text through real AI framing, not a
+        if (isLineDriven) {
+          // Custom/upload mode has no honest offline fallback — the whole point
+          // is running the user's exact text through real AI framing, not a
           // template. Fail loudly instead of pretending it worked.
           showToast(`❌ Не удалось разобрать текст на кадры (${res.error || 'нет ключа/сессии'})`);
           return;
@@ -398,91 +436,216 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
       }));
 
       setHeroName(res.heroMaster.name);
-      showToast(`✨ Сценарий готов (реально через Gemini): создано ${generatedPrompts.length} промптов под кадры! Синтезируем озвучку для точного тайминга...`);
 
-      // Real TTS via Lumean — replaces estimated durations (chars/13.5) with
-      // the ACTUAL spoken duration of each line, from its real subtitles.srt
-      // cue (one cue per sentence, matching one scene each). "Монтаж по
-      // словам озвучки" only means anything with real audio backing it.
+      // Establish the real narration audio + its true wall-clock length, then
+      // anchor the whole video to it. Upload mode already HAS the user's audio;
+      // custom/generate modes synthesize it via Lumean.
       let narrationAudioUrl: string | undefined;
+      let realTotalSec = 0;
       try {
-        const voiceRes = await synthesizeVoiceReal({ text: fullScript, langCode: scriptLanguage });
-        if (voiceRes.audioUrl) {
-          narrationAudioUrl = voiceRes.audioUrl;
-          const cues = voiceRes.cues || [];
-          // Real total spoken length, most-trustworthy source first: the actual
-          // mp3's own duration, then Lumean's reported durationMs, then the last
-          // SRT cue's end. This is the number the whole video MUST match.
-          const measuredSec = await measureAudioDurationSec(voiceRes.audioUrl);
-          const realTotalSec =
-            measuredSec ||
-            (voiceRes.durationMs ? voiceRes.durationMs / 1000 : 0) ||
-            (cues.length ? cues[cues.length - 1].endSec : 0);
-
-          if (cues.length === newScenes.length) {
-            // Ideal: one cue per block — use each cue's real duration directly.
-            cues.forEach((cue, idx) => {
-              newScenes[idx].duration = Number((cue.endSec - cue.startSec).toFixed(2));
-            });
-            showToast('🎙️ Реальная озвучка синтезирована — тайминг кадров взят из настоящих таймкодов Lumean.');
-          } else if (realTotalSec > 0) {
-            // Cue count ≠ block count (Lumean splits by sentence, AI groups by
-            // scene). The char-estimate sum badly undershoots real audio, so
-            // scale every block so the TOTAL equals the real narration length,
-            // weighting by each block's text length (longer line = more time).
-            const weights = newScenes.map((s) => Math.max(1, (s.description || '').length));
-            const weightSum = weights.reduce((a, b) => a + b, 0);
-            newScenes.forEach((s, idx) => {
-              s.duration = Number(((weights[idx] / weightSum) * realTotalSec).toFixed(2));
-            });
-            showToast(`🎙️ Озвучка синтезирована (${Math.round(realTotalSec)} сек) — тайминг кадров подогнан под реальную длину аудио.`);
+        if (scriptTab === 'upload' && uploadedAudio) {
+          narrationAudioUrl = uploadedAudio.objectUrl;
+          // Prefer the browser's own reading of the local file; fall back to the
+          // server-measured duration from the upload.
+          const measuredSec = await measureAudioDurationSec(uploadedAudio.objectUrl);
+          realTotalSec = measuredSec || (uploadedDurationMs ? uploadedDurationMs / 1000 : 0);
+          showToast(`🎧 Ваша озвучка подключена (${Math.round(realTotalSec)} сек) — тайминг кадров подогнан под неё.`);
+        } else {
+          showToast(`✨ Сценарий готов: ${generatedPrompts.length} промптов! Синтезирую озвучку для точного тайминга...`);
+          const voiceRes = await synthesizeVoiceReal({ text: fullScript, langCode: scriptLanguage });
+          if (voiceRes.audioUrl) {
+            narrationAudioUrl = voiceRes.audioUrl;
+            const cues = voiceRes.cues || [];
+            const measuredSec = await measureAudioDurationSec(voiceRes.audioUrl);
+            const durationMsSec = voiceRes.durationMs ? voiceRes.durationMs / 1000 : 0;
+            const lastCueSec = cues.length ? cues[cues.length - 1].endSec : 0;
+            realTotalSec = measuredSec || durationMsSec || lastCueSec;
+            const srcLabel = measuredSec ? 'mp3' : durationMsSec ? 'durationMs' : lastCueSec ? 'cue' : 'нет';
+            const estSum = Math.round(newScenes.reduce((a, s) => a + s.duration, 0));
+            showToast(`🔎 Аудио: mp3=${Math.round(measuredSec)}с, durationMs=${Math.round(durationMsSec)}с, cues=${cues.length}, блоков=${newScenes.length}, оценка=${estSum}с → взято ${srcLabel}=${Math.round(realTotalSec)}с`);
+            if (realTotalSec > 0) showToast(`🎙️ Озвучка синтезирована (${Math.round(realTotalSec)} сек) — тайминг подогнан под реальную длину аудио.`);
+          } else if (voiceRes.error) {
+            showToast(`⚠️ Озвучка не удалась (${voiceRes.error}) — тайминг остался оценочным по длине текста.`);
           }
-        } else if (voiceRes.error) {
-          showToast(`⚠️ Озвучка не удалась (${voiceRes.error}) — тайминг остался оценочным по длине текста.`);
+        }
+
+        // Anchor the WHOLE video to the real wall-clock audio length (incl.
+        // pauses), distributed across blocks by text weight.
+        if (realTotalSec > 0) {
+          const weights = newScenes.map((s) => Math.max(1, (s.description || '').length));
+          const weightSum = weights.reduce((a, b) => a + b, 0);
+          newScenes.forEach((s, idx) => {
+            s.duration = Number(((weights[idx] / weightSum) * realTotalSec).toFixed(2));
+          });
         }
       } catch (err: any) {
         showToast(`⚠️ Озвучка не удалась (${err?.message || 'ошибка'}) — тайминг остался оценочным.`);
       }
 
-      // Content boundaries are decided above by the director AI — this is a
-      // separate pacing pass: nothing stays on screen longer than ~4-8s just
-      // because its scene ran long in the narration (see
-      // splitScenesByDurationCap for the exact N = floor(sec/4) rule, capped
-      // per block so one scene anchored to a long stretch of real audio can't
-      // explode into dozens of shots).
-      const splitScenes = splitScenesByDurationCap(newScenes);
-      if (splitScenes.length !== newScenes.length) {
-        setPromptsText(splitScenes.map((s, i) => `${i + 1}. ${s.prompt}`).join('\n'));
-        showToast(`🎞️ Длинные сцены разбиты на кадры по ракурсам: ${newScenes.length} → ${splitScenes.length} кадров`);
-      }
-
-      const { timelineClips, totalDuration } = buildSynchronizedTimeline(splitScenes, selectedRatio, selectedStyleId);
-      onUpdateProject({ scriptText: fullScript, scenes: splitScenes, timelineClips, duration: totalDuration, narrationAudioUrl, heroName: res.heroMaster.name });
-
-      // Generate the hero reference image now, once — every scene in
-      // handleRunBatch reuses it for character consistency (п.04). It must
-      // go through the same custom style the user picked, or the portrait
-      // comes back in a different style than everything else in the batch.
-      try {
-        const activeCustomStyleForHero = customStyles.find((s) => s.id === selectedStyleId);
-        const heroPrompt = `Portrait of ${res.heroMaster.name}, ${res.heroMaster.appearance}, wearing: ${res.heroMaster.clothing}, key feature: ${res.heroMaster.keyFeature}. Cinematic lighting, 85mm portrait, consistent reference look, plain neutral background.`;
-        const heroImgRes = await generateImageReal({
-          prompt: activeCustomStyleForHero?.negativePrompt ? `${heroPrompt}. Avoid: ${activeCustomStyleForHero.negativePrompt}` : heroPrompt,
-          modelCode: selectedModel,
-          aspectRatio: '1:1',
-          styleReferenceImages: activeCustomStyleForHero?.referenceImages,
-        });
-        if (heroImgRes.imageBase64) {
-          const newHeroRef = { base64: heroImgRes.imageBase64, mimeType: heroImgRes.mimeType || 'image/png' };
-          setHeroRefImage(newHeroRef);
-          onUpdateProject({ heroRefImage: newHeroRef });
-          showToast(`🎬 Эталон героя «${res.heroMaster.name}» сгенерирован — будет использован для консистентности во всех кадрах.`);
-        }
-      } catch {
-        // non-fatal — batch generation still works without hero consistency
-      }
+      await finalizeAndCommit(newScenes, res.heroMaster, fullScript, narrationAudioUrl);
     } catch (err: any) {
       showToast(`❌ Ошибка генерации сценария: ${err?.message || 'неизвестная ошибка'}`);
+    } finally {
+      setIsGeneratingScript(false);
+      setScriptBatchProgress(null);
+    }
+  };
+
+  // Shared finalize step for every script mode: split each block into ~4s
+  // sub-shots (varying camera angle), rebuild the prompt list + montage, save
+  // the project, and generate the hero reference portrait once.
+  const finalizeAndCommit = async (
+    scenesWithDurations: StoryScene[],
+    heroMaster: GeneratedHero,
+    fullScript: string,
+    narrationAudioUrl: string | undefined,
+  ) => {
+    // splitScenesByDurationCap (autoAssembly.ts) owns the actual math: exact
+    // user spec is N = floor(sec/4), so a 6s scene stays whole (6/2=3 < 4)
+    // instead of getting cut into two sub-4s shots — round() here would
+    // violate that. Single source of truth for every script mode that calls
+    // finalizeAndCommit (custom text, uploaded voiceover, Lumean tab, etc).
+    const expandedScenes = splitScenesByDurationCap(scenesWithDurations);
+
+    const expandedPromptsText = expandedScenes.map((s, i) => `${i + 1}. ${s.prompt}`).join('\n');
+    setPromptsText(expandedPromptsText);
+    const finalTotalSec = Math.round(expandedScenes.reduce((a, s) => a + s.duration, 0));
+    showToast(`🎬 Итог: ${scenesWithDurations.length} сцен → ${expandedScenes.length} кадров, суммарно ${finalTotalSec} сек ролика.`);
+
+    const { timelineClips, totalDuration } = buildSynchronizedTimeline(expandedScenes, selectedRatio, selectedStyleId);
+    onUpdateProject({ scriptText: fullScript, scenes: expandedScenes, timelineClips, duration: totalDuration, narrationAudioUrl, heroName: heroMaster.name });
+
+    try {
+      const activeCustomStyleForHero = customStyles.find((s) => s.id === selectedStyleId);
+      const heroPrompt = `Portrait of ${heroMaster.name}, ${heroMaster.appearance}, wearing: ${heroMaster.clothing}, key feature: ${heroMaster.keyFeature}. Cinematic lighting, 85mm portrait, consistent reference look, plain neutral background.`;
+      const heroImgRes = await generateImageReal({
+        prompt: activeCustomStyleForHero?.negativePrompt ? `${heroPrompt}. Avoid: ${activeCustomStyleForHero.negativePrompt}` : heroPrompt,
+        modelCode: selectedModel,
+        aspectRatio: '1:1',
+        styleReferenceImages: activeCustomStyleForHero?.referenceImages,
+      });
+      if (heroImgRes.imageBase64) {
+        const newHeroRef = { base64: heroImgRes.imageBase64, mimeType: heroImgRes.mimeType || 'image/png' };
+        setHeroRefImage(newHeroRef);
+        onUpdateProject({ heroRefImage: newHeroRef });
+        showToast(`🎬 Эталон героя «${heroMaster.name}» сгенерирован — будет использован для консистентности во всех кадрах.`);
+      }
+    } catch {
+      // non-fatal — batch generation still works without hero consistency
+    }
+  };
+
+  // Lumean tab, step 1: synthesize the pasted tagged text into real audio +
+  // pause-accurate subtitle timecodes. Nothing is split yet — the user reviews
+  // the mp3/subs, then presses "собрать промпты по таймкодам".
+  const handleSynthesizeLumean = async () => {
+    if (!lumeanText.trim()) {
+      showToast('Сначала вставь текст озвучки (можно с тегами [pause], [somber] и т.д.)');
+      return;
+    }
+    setIsSynthesizing(true);
+    setLumeanResult(null);
+    try {
+      showToast('🎙️ Отправляю текст в Lumean на озвучку — это может занять до 2 минут…');
+      const voiceRes = await synthesizeVoiceReal({ text: lumeanText, langCode: scriptLanguage });
+      if (voiceRes.error || !voiceRes.audioUrl) {
+        showToast(`❌ Озвучка не удалась (${voiceRes.error || 'нет аудио'})`);
+        return;
+      }
+      setLumeanResult(voiceRes);
+      const totalSec = voiceRes.durationMs ? Math.round(voiceRes.durationMs / 1000) : (voiceRes.cues?.length ? Math.round(voiceRes.cues[voiceRes.cues.length - 1].endSec) : 0);
+      showToast(`✅ Озвучка готова: ${totalSec} сек, ${voiceRes.cues?.length || 0} таймкод-сегментов. Можно скачать mp3/SRT и собрать промпты.`);
+    } catch (err: any) {
+      showToast(`❌ Ошибка озвучки (${err?.message || 'сбой'})`);
+    } finally {
+      setIsSynthesizing(false);
+    }
+  };
+
+  // Lumean tab, step 2: build prompts and split shots by the REAL Lumean SRT
+  // timecodes (pause-accurate), not by estimate. Each block's duration comes
+  // from where its cues actually fall on the audio timeline.
+  const handleBuildFromLumean = async () => {
+    if (!lumeanResult?.cues?.length) {
+      showToast('Сначала озвучь текст — нужны таймкоды из Lumean');
+      return;
+    }
+    const cues = lumeanResult.cues;
+    const totalSec = lumeanResult.durationMs ? lumeanResult.durationMs / 1000 : cues[cues.length - 1].endSec;
+
+    setIsGeneratingScript(true);
+    setScriptBatchProgress(null);
+    try {
+      // Director pass on the cue texts (same custom pipeline), so each block
+      // carries sourceLineIndices back to the exact cues it covers.
+      const CUSTOM_BATCH_SIZE = 20;
+      const lines = cues.map((c) => c.text);
+      const batches: string[][] = [];
+      for (let i = 0; i < lines.length; i += CUSTOM_BATCH_SIZE) batches.push(lines.slice(i, i + CUSTOM_BATCH_SIZE));
+      const allBlocks: GeneratedBlock[] = [];
+      let sharedHero: GeneratedHero | undefined;
+      let lineOffset = 0;
+      for (let b = 0; b < batches.length; b++) {
+        setScriptBatchProgress({ current: b + 1, total: batches.length });
+        const batchRes = await generateScriptReal({
+          mode: 'custom',
+          scriptLines: batches[b],
+          topicPrompt: customContextHint.trim() || undefined,
+          heroOverride: sharedHero?.name,
+          language: scriptLanguage,
+        });
+        if (batchRes.isSimulated || !batchRes.blocks?.length || !batchRes.heroMaster) {
+          if (allBlocks.length === 0) {
+            showToast(`❌ Не удалось разобрать текст на кадры (${batchRes.error || 'нет ответа'})`);
+            return;
+          }
+          showToast(`⚠️ Собрано частично: ${allBlocks.length} блоков, дальше остановилось. Уже готовое не потеряно.`);
+          break;
+        }
+        if (!sharedHero) sharedHero = batchRes.heroMaster;
+        // Shift each block's 1-based indices into the global cue list.
+        batchRes.blocks.forEach((blk) => {
+          allBlocks.push({ ...blk, sourceLineIndices: (blk.sourceLineIndices || []).map((n) => n + lineOffset) });
+        });
+        lineOffset += batches[b].length;
+      }
+      if (!sharedHero || allBlocks.length === 0) {
+        showToast('❌ Не удалось собрать блоки из озвучки');
+        return;
+      }
+
+      // Real, pause-accurate block durations from the cue timeline: each block
+      // spans from its first cue's start to the next block's first cue start;
+      // the last block runs to the end of the audio. This tiles the whole
+      // timeline including the silences Lumean placed for [pause] tags.
+      const blockStarts = allBlocks.map((blk) => {
+        const idxs = (blk.sourceLineIndices || []).filter((n) => n >= 1 && n <= cues.length);
+        const firstCue = idxs.length ? cues[Math.min(...idxs) - 1] : undefined;
+        return firstCue ? firstCue.startSec : 0;
+      });
+      const generatedPrompts = allBlocks.map((b) => compileNineFieldsPrompt(b.nineFields, sharedHero!.name));
+      const fullScript = allBlocks.map((b) => b.scriptLine).join('\n\n');
+      setScriptTopic(fullScript);
+      setHeroName(sharedHero.name);
+
+      const newScenes: StoryScene[] = allBlocks.map((b, idx) => ({
+        id: idx + 1,
+        title: `План 0${idx + 1}: ${b.scriptLine.slice(0, 28)}...`,
+        duration: Number((( idx + 1 < blockStarts.length ? blockStarts[idx + 1] : totalSec) - blockStarts[idx]).toFixed(2)),
+        description: b.scriptLine,
+        prompt: generatedPrompts[idx],
+        generatedImageUrl: undefined,
+        motionType: b.motionType,
+        transition: 'crossfade',
+      }));
+      // Guard against any non-positive span (out-of-order cues) — fall back to a
+      // small floor so the shot still exists.
+      newScenes.forEach((s) => { if (!(s.duration > 0)) s.duration = 4; });
+
+      showToast(`🎬 Тайминг взят из реальных таймкодов Lumean (${Math.round(totalSec)} сек, ${allBlocks.length} блоков) — режу по паузам.`);
+      await finalizeAndCommit(newScenes, sharedHero, fullScript, lumeanResult.audioUrl);
+    } catch (err: any) {
+      showToast(`❌ Ошибка сборки (${err?.message || 'сбой'})`);
     } finally {
       setIsGeneratingScript(false);
       setScriptBatchProgress(null);
@@ -1010,6 +1173,10 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
                 <span className="text-[11px] text-stone-500 font-mono">
                   {scriptTab === 'custom'
                     ? `${customScriptLines.length} сцены из текста`
+                    : scriptTab === 'upload'
+                    ? (uploadedAudio ? 'аудио загружено' : 'аудио не выбрано')
+                    : scriptTab === 'lumean'
+                    ? (lumeanResult?.cues?.length ? `${lumeanResult.cues.length} таймкодов` : 'текст → озвучка')
                     : `${estimatedSceneCount} сцен по ${SECONDS_PER_SCENE} с`}
                 </span>
               </div>
@@ -1036,6 +1203,26 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
                     }`}
                   >
                     У меня свой текст
+                  </button>
+                  <button
+                    onClick={() => setScriptTab('upload')}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                      scriptTab === 'upload'
+                        ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                        : 'bg-[#1a130e] text-stone-400 hover:text-white border border-[#2e2216]'
+                    }`}
+                  >
+                    Загрузить свою озвучку
+                  </button>
+                  <button
+                    onClick={() => setScriptTab('lumean')}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                      scriptTab === 'lumean'
+                        ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                        : 'bg-[#1a130e] text-stone-400 hover:text-white border border-[#2e2216]'
+                    }`}
+                  >
+                    Озвучить текст (Lumean)
                   </button>
                 </div>
 
@@ -1146,7 +1333,7 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
                     Сценарист пишет текст под выбранный хронометраж — количество сцен и таймкоды считаются от него (~{SECONDS_PER_SCENE} сек на сцену). Промпты появятся ниже, их можно править перед запуском.
                   </p>
                 </>
-              ) : (
+              ) : scriptTab === 'custom' ? (
                 <>
                   {/* Textarea — custom mode: the pasted text goes into the video verbatim */}
                   <textarea
@@ -1206,6 +1393,164 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
                           <Sparkles className="w-3.5 h-3.5" />
                           <span>Написать сценарий</span>
                         </>
+                      )}
+                    </button>
+                  </div>
+                </>
+              ) : scriptTab === 'upload' ? (
+                <>
+                  {/* Upload mode: user's own voiceover → transcribe → same pipeline */}
+                  <label className="block cursor-pointer">
+                    <div className="w-full bg-[#1a130e] border border-dashed border-[#3a2c1c] hover:border-amber-500/60 rounded-xl p-6 text-center transition-colors">
+                      <input
+                        type="file"
+                        accept="audio/*"
+                        className="hidden"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (!file) return;
+                          const reader = new FileReader();
+                          reader.onload = () => {
+                            const dataUrl = String(reader.result || '');
+                            const base64 = dataUrl.replace(/^data:[^;]+;base64,/, '');
+                            if (uploadedAudio?.objectUrl) URL.revokeObjectURL(uploadedAudio.objectUrl);
+                            setUploadedAudio({
+                              base64,
+                              mimeType: file.type || 'audio/mpeg',
+                              name: file.name,
+                              objectUrl: URL.createObjectURL(file),
+                            });
+                          };
+                          reader.readAsDataURL(file);
+                        }}
+                      />
+                      {uploadedAudio ? (
+                        <div className="space-y-2">
+                          <p className="text-sm text-emerald-300 font-mono">🎧 {uploadedAudio.name}</p>
+                          <audio controls src={uploadedAudio.objectUrl} className="mx-auto w-full max-w-md" />
+                          <p className="text-[11px] text-stone-500">Нажми, чтобы выбрать другой файл</p>
+                        </div>
+                      ) : (
+                        <div className="space-y-1">
+                          <p className="text-sm text-stone-300 font-mono">Загрузи свою озвучку (mp3, wav, m4a)</p>
+                          <p className="text-[11px] text-stone-500">ИИ сам расшифрует речь, напишет по ней сценарий и соберёт промпты кадров — тайминг возьмётся из реальной длины твоего аудио.</p>
+                        </div>
+                      )}
+                    </div>
+                  </label>
+
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-mono uppercase text-stone-400">Язык озвучки:</span>
+                    <select
+                      value={scriptLanguage}
+                      onChange={(e) => setScriptLanguage(e.target.value)}
+                      className="bg-[#1a130e] border border-[#2e2217] rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none"
+                    >
+                      {ELEVEN_LANGUAGES.map((l) => (
+                        <option key={l.id} value={l.id}>по-{l.nativeName.toLowerCase()}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-between gap-4 pt-2">
+                    <span className="text-[11px] text-stone-500 font-mono">
+                      {uploadedAudio ? 'Аудио готово — жми, и ИИ расшифрует его и соберёт кадры под реальный хронометраж.' : 'Сначала выбери аудиофайл выше.'}
+                    </span>
+                    <button
+                      onClick={handleGenerateScript}
+                      disabled={isGeneratingScript || !uploadedAudio}
+                      className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-amber-500 to-yellow-400 hover:from-amber-400 hover:to-yellow-300 text-black font-semibold text-xs transition-all shadow-md flex items-center gap-2 disabled:opacity-50"
+                    >
+                      {isGeneratingScript ? (
+                        <>
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                          <span>
+                            {scriptBatchProgress
+                              ? `Сегмент ${scriptBatchProgress.current} из ${scriptBatchProgress.total}... ${scriptGenElapsed}с`
+                              : `Расшифровка и разбор... ${scriptGenElapsed}с`}
+                          </span>
+                        </>
+                      ) : (
+                        <>
+                          <Sparkles className="w-3.5 h-3.5" />
+                          <span>Расшифровать и собрать сценарий</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  {/* Lumean mode: tagged text → real synth → pause-accurate timecodes → prompts */}
+                  <textarea
+                    value={lumeanText}
+                    onChange={(e) => setLumeanText(e.target.value)}
+                    rows={7}
+                    placeholder={"Вставь готовый текст озвучки — можно с тегами.\n\n[serious] Это была самая холодная зима за сто лет. [pause] Никто не ждал того, что случилось дальше.\n[somber] К утру деревня опустела."}
+                    className="w-full bg-[#1a130e] border border-[#302418] rounded-xl p-3 text-xs md:text-sm text-stone-200 placeholder-stone-600 focus:outline-none focus:border-amber-500/70 font-mono leading-relaxed"
+                  />
+                  <p className="text-[10px] text-stone-500 leading-relaxed">
+                    Lumean озвучит текст (теги вроде [pause]/[somber] влияют на интонацию и паузы), вернёт mp3 и точные таймкоды-субтитры. Кадры порежутся по этим РЕАЛЬНЫМ таймкодам — граница кадра садится на реальную паузу, а не на оценку. Дальше та же логика: ~4 сек на кадр, эталон героя, промпты по 9 полям.
+                  </p>
+
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-mono uppercase text-stone-400">Язык:</span>
+                    <select
+                      value={scriptLanguage}
+                      onChange={(e) => setScriptLanguage(e.target.value)}
+                      className="bg-[#1a130e] border border-[#2e2217] rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none"
+                    >
+                      {ELEVEN_LANGUAGES.map((l) => (
+                        <option key={l.id} value={l.id}>по-{l.nativeName.toLowerCase()}</option>
+                      ))}
+                    </select>
+                    <button
+                      onClick={handleSynthesizeLumean}
+                      disabled={isSynthesizing || isGeneratingScript || !lumeanText.trim()}
+                      className="ml-auto px-4 py-2 rounded-xl bg-[#1f1710] hover:bg-[#2c2117] text-amber-300 font-semibold text-xs border border-amber-500/40 flex items-center gap-2 transition-colors disabled:opacity-50"
+                    >
+                      {isSynthesizing ? (
+                        <><RefreshCw className="w-3.5 h-3.5 animate-spin" /><span>Озвучиваю… (до 2 мин)</span></>
+                      ) : (
+                        <><Sparkles className="w-3.5 h-3.5" /><span>1. Озвучить через Lumean</span></>
+                      )}
+                    </button>
+                  </div>
+
+                  {lumeanResult?.audioUrl && (
+                    <div className="p-3 rounded-xl bg-[#12100b] border border-emerald-500/25 space-y-2">
+                      <p className="text-[11px] text-emerald-300 font-mono">
+                        🎙️ Озвучка готова: {lumeanResult.durationMs ? Math.round(lumeanResult.durationMs / 1000) : (lumeanResult.cues?.length ? Math.round(lumeanResult.cues[lumeanResult.cues.length - 1].endSec) : 0)} сек, {lumeanResult.cues?.length || 0} таймкод-сегментов.
+                      </p>
+                      <audio controls src={lumeanResult.audioUrl} className="w-full max-w-md" />
+                      <div className="flex flex-wrap gap-3 text-[11px]">
+                        <a href={lumeanResult.audioUrl} download="voiceover.mp3" className="text-amber-300 hover:text-amber-200 underline">Скачать mp3</a>
+                        {lumeanResult.srtUrl && <a href={lumeanResult.srtUrl} download="subtitles.srt" className="text-amber-300 hover:text-amber-200 underline">Скачать таймкоды (SRT)</a>}
+                        {lumeanResult.vttUrl && <a href={lumeanResult.vttUrl} download="subtitles.vtt" className="text-amber-300 hover:text-amber-200 underline">Скачать субтитры (VTT)</a>}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="flex flex-wrap items-center justify-between gap-4 pt-1">
+                    <span className="text-[11px] text-stone-500 font-mono">
+                      {lumeanResult?.cues?.length ? 'Таймкоды получены — жми, чтобы собрать промпты и порезать кадры по паузам.' : 'Сначала озвучь текст (шаг 1).'}
+                    </span>
+                    <button
+                      onClick={handleBuildFromLumean}
+                      disabled={isGeneratingScript || isSynthesizing || !lumeanResult?.cues?.length}
+                      className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-amber-500 to-yellow-400 hover:from-amber-400 hover:to-yellow-300 text-black font-semibold text-xs transition-all shadow-md flex items-center gap-2 disabled:opacity-50"
+                    >
+                      {isGeneratingScript ? (
+                        <>
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                          <span>
+                            {scriptBatchProgress
+                              ? `Сегмент ${scriptBatchProgress.current} из ${scriptBatchProgress.total}... ${scriptGenElapsed}с`
+                              : `Собираю кадры... ${scriptGenElapsed}с`}
+                          </span>
+                        </>
+                      ) : (
+                        <><Sparkles className="w-3.5 h-3.5" /><span>2. Собрать промпты по таймкодам</span></>
                       )}
                     </button>
                   </div>

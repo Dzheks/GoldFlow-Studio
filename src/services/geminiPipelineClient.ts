@@ -24,6 +24,8 @@ export interface GeneratedBlock {
   scriptLine: string;
   nineFields: NineFieldsResult;
   motionType: 'zoom-in' | 'zoom-out' | 'pan-left' | 'pan-right' | 'static';
+  // 1-based indices of the source lines this block covers (custom/upload mode).
+  sourceLineIndices?: number[];
 }
 
 export interface GeneratedHero {
@@ -127,6 +129,9 @@ export interface SynthesizeVoiceResult {
   audioUrl?: string;
   durationMs?: number | null;
   cues?: { index: number; startSec: number; endSec: number; text: string }[];
+  srtUrl?: string;
+  vttUrl?: string;
+  srtText?: string;
   error?: string;
 }
 
@@ -144,6 +149,33 @@ export async function synthesizeVoiceReal(payload: {
     const data = await res.json();
     if (!res.ok) {
       return { error: data?.error || 'Ошибка озвучки' };
+    }
+    return data;
+  } catch (err: any) {
+    return { error: err?.message || 'Сервер недоступен' };
+  }
+}
+
+export interface TranscribeVoiceResult {
+  text?: string;
+  durationMs?: number | null;
+  error?: string;
+}
+
+export async function transcribeVoiceReal(payload: {
+  audioBase64: string;
+  mimeType?: string;
+  language?: string;
+}): Promise<TranscribeVoiceResult> {
+  try {
+    const res = await fetch('/api/transcribe-voice', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      return { error: data?.error || 'Ошибка расшифровки' };
     }
     return data;
   } catch (err: any) {
