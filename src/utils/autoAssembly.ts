@@ -96,6 +96,8 @@ const CAMERA_ANGLE_VARIANTS = [
   'high-angle shot of this same moment',
 ];
 
+const MOTION_CYCLE: StoryScene['motionType'][] = ['zoom-in', 'pan-left', 'zoom-out', 'pan-right'];
+
 /**
  * The director AI decides scene CONTENT boundaries (what belongs together
  * by meaning) — but a single held image can't stay on screen for 9-12s of
@@ -104,18 +106,23 @@ const CAMERA_ANGLE_VARIANTS = [
  * scene over 4s gets split into N even sub-frames (N = floor(duration/4),
  * so each half is never under 4s — 9s becomes 2×4.5s, 12s becomes 3×4s, but
  * 6s stays one frame since splitting it would drop under the 4s floor).
- * Every sub-frame keeps the exact same narration text and base prompt — the
- * only thing that changes is an appended camera-angle instruction, so it
+ * Capped at MAX_SUBFRAMES so a scene whose duration got anchored to a long
+ * stretch of real audio (see the cue/block-count mismatch fallback in
+ * ContentFactory) can't explode into dozens of shots. Every sub-frame keeps
+ * the exact same narration text and base prompt — the only things that
+ * change are an appended camera-angle instruction and the pan/zoom motion
+ * (cycled so consecutive sub-frames don't all move the same way), so it
  * reads as multiple shots of the same scene, not new content.
  */
 export function splitScenesByDurationCap(scenes: StoryScene[]): StoryScene[] {
   const MIN_FRAME_SECONDS = 4;
+  const MAX_SUBFRAMES = 12;
   const result: StoryScene[] = [];
   let nextId = 1;
 
   for (const scene of scenes) {
     const duration = scene.duration || estimateSpeechDuration(scene.description);
-    const n = Math.max(1, Math.floor(duration / MIN_FRAME_SECONDS));
+    const n = Math.max(1, Math.min(MAX_SUBFRAMES, Math.floor(duration / MIN_FRAME_SECONDS)));
 
     if (n <= 1) {
       result.push({ ...scene, id: nextId++ });
@@ -132,6 +139,7 @@ export function splitScenesByDurationCap(scenes: StoryScene[]): StoryScene[] {
         title: `План ${id}: ${scene.description.slice(0, 24)}... (ракурс ${i + 1}/${n})`,
         duration: perPartDuration,
         prompt: `${scene.prompt}. Camera angle ${i + 1} of ${n} for this same moment: ${angle}.`,
+        motionType: MOTION_CYCLE[i % MOTION_CYCLE.length],
       });
     }
   }

@@ -61,6 +61,28 @@ interface ContentFactoryProps {
   onDeductCredits: (amount: number) => boolean;
 }
 
+// Authoritative real narration length: load the actual mp3 and read its
+// duration. Lumean's reported durationMs/cues are sometimes missing or wrong,
+// but the audio file itself never lies. Resolves 0 if it can't be measured.
+function measureAudioDurationSec(url: string): Promise<number> {
+  return new Promise((resolve) => {
+    try {
+      const audio = new Audio();
+      audio.preload = 'metadata';
+      const done = (v: number) => { audio.src = ''; resolve(v); };
+      const timer = setTimeout(() => done(0), 15000);
+      audio.addEventListener('loadedmetadata', () => {
+        clearTimeout(timer);
+        done(Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0);
+      });
+      audio.addEventListener('error', () => { clearTimeout(timer); done(0); });
+      audio.src = url;
+    } catch {
+      resolve(0);
+    }
+  });
+}
+
 export const ContentFactory: React.FC<ContentFactoryProps> = ({
   project,
   onUpdateProject,
@@ -385,12 +407,36 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
       let narrationAudioUrl: string | undefined;
       try {
         const voiceRes = await synthesizeVoiceReal({ text: fullScript, langCode: scriptLanguage });
-        if (voiceRes.audioUrl && voiceRes.cues?.length === newScenes.length) {
-          voiceRes.cues.forEach((cue, idx) => {
-            newScenes[idx].duration = Number((cue.endSec - cue.startSec).toFixed(2));
-          });
+        if (voiceRes.audioUrl) {
           narrationAudioUrl = voiceRes.audioUrl;
-          showToast('🎙️ Реальная озвучка синтезирована — тайминг кадров взят из настоящих таймкодов Lumean.');
+          const cues = voiceRes.cues || [];
+          // Real total spoken length, most-trustworthy source first: the actual
+          // mp3's own duration, then Lumean's reported durationMs, then the last
+          // SRT cue's end. This is the number the whole video MUST match.
+          const measuredSec = await measureAudioDurationSec(voiceRes.audioUrl);
+          const realTotalSec =
+            measuredSec ||
+            (voiceRes.durationMs ? voiceRes.durationMs / 1000 : 0) ||
+            (cues.length ? cues[cues.length - 1].endSec : 0);
+
+          if (cues.length === newScenes.length) {
+            // Ideal: one cue per block — use each cue's real duration directly.
+            cues.forEach((cue, idx) => {
+              newScenes[idx].duration = Number((cue.endSec - cue.startSec).toFixed(2));
+            });
+            showToast('🎙️ Реальная озвучка синтезирована — тайминг кадров взят из настоящих таймкодов Lumean.');
+          } else if (realTotalSec > 0) {
+            // Cue count ≠ block count (Lumean splits by sentence, AI groups by
+            // scene). The char-estimate sum badly undershoots real audio, so
+            // scale every block so the TOTAL equals the real narration length,
+            // weighting by each block's text length (longer line = more time).
+            const weights = newScenes.map((s) => Math.max(1, (s.description || '').length));
+            const weightSum = weights.reduce((a, b) => a + b, 0);
+            newScenes.forEach((s, idx) => {
+              s.duration = Number(((weights[idx] / weightSum) * realTotalSec).toFixed(2));
+            });
+            showToast(`🎙️ Озвучка синтезирована (${Math.round(realTotalSec)} сек) — тайминг кадров подогнан под реальную длину аудио.`);
+          }
         } else if (voiceRes.error) {
           showToast(`⚠️ Озвучка не удалась (${voiceRes.error}) — тайминг остался оценочным по длине текста.`);
         }
@@ -401,7 +447,9 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
       // Content boundaries are decided above by the director AI — this is a
       // separate pacing pass: nothing stays on screen longer than ~4-8s just
       // because its scene ran long in the narration (see
-      // splitScenesByDurationCap for the exact N = floor(sec/4) rule).
+      // splitScenesByDurationCap for the exact N = floor(sec/4) rule, capped
+      // per block so one scene anchored to a long stretch of real audio can't
+      // explode into dozens of shots).
       const splitScenes = splitScenesByDurationCap(newScenes);
       if (splitScenes.length !== newScenes.length) {
         setPromptsText(splitScenes.map((s, i) => `${i + 1}. ${s.prompt}`).join('\n'));
