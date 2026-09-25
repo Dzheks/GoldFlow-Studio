@@ -374,30 +374,59 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
                   }
                   return flat;
                 })();
+            // Run the FIRST batch alone so it produces a hero name; then fan out
+            // the remaining batches in parallel with heroOverride = that name.
+            // This keeps character consistency (all batches share one hero) but
+            // takes O(one batch) instead of O(N batches) of wall time —
+            // typically 30-60s instead of 3-5 min on a 4-batch script.
             const allBlocks: GeneratedBlock[] = [];
-            let sharedHero: GeneratedHero | undefined;
-            for (let b = 0; b < batches.length; b++) {
-              setScriptBatchProgress({ current: b + 1, total: batches.length });
-              const batchRes = await generateScriptReal({
-                mode: 'custom',
-                scriptLines: batches[b],
-                topicPrompt: customContextHint.trim() || undefined,
-                heroOverride: sharedHero?.name,
-                language: scriptLanguage,
-              });
-              if (batchRes.isSimulated || !batchRes.blocks?.length || !batchRes.heroMaster) {
-                // Keep whatever batches already succeeded instead of
-                // throwing away real, already-paid-for generations.
-                return {
-                  blocks: allBlocks,
-                  heroMaster: sharedHero,
-                  isSimulated: allBlocks.length === 0,
-                  error: `сегмент ${b + 1} из ${batches.length}: ${batchRes.error || 'нет ответа'}`,
-                  partial: allBlocks.length > 0,
-                };
+            setScriptBatchProgress({ current: 1, total: batches.length });
+            const firstRes = await generateScriptReal({
+              mode: 'custom',
+              scriptLines: batches[0],
+              topicPrompt: customContextHint.trim() || undefined,
+              language: scriptLanguage,
+            });
+            if (firstRes.isSimulated || !firstRes.blocks?.length || !firstRes.heroMaster) {
+              return { blocks: [], heroMaster: undefined, isSimulated: true, error: `сегмент 1 из ${batches.length}: ${firstRes.error || 'нет ответа'}` };
+            }
+            const sharedHero: GeneratedHero = firstRes.heroMaster;
+            allBlocks.push(...firstRes.blocks);
+
+            if (batches.length === 1) {
+              return { blocks: allBlocks, heroMaster: sharedHero, isSimulated: false };
+            }
+
+            const restResults: Array<{ ok: boolean; blocks: GeneratedBlock[]; batchIdx: number; error?: string } | undefined> = new Array(batches.length);
+            let completed = 1;
+            const queue = Array.from({ length: batches.length - 1 }, (_, i) => i + 1);
+            const CONCURRENCY = Math.min(4, queue.length);
+            const runners = Array.from({ length: CONCURRENCY }, async () => {
+              while (queue.length > 0) {
+                const idx = queue.shift();
+                if (idx === undefined) return;
+                const r = await generateScriptReal({
+                  mode: 'custom',
+                  scriptLines: batches[idx],
+                  topicPrompt: customContextHint.trim() || undefined,
+                  heroOverride: sharedHero.name,
+                  language: scriptLanguage,
+                });
+                restResults[idx] = r.isSimulated || !r.blocks?.length
+                  ? { ok: false, blocks: [], batchIdx: idx, error: r.error || 'нет ответа' }
+                  : { ok: true, blocks: r.blocks, batchIdx: idx };
+                completed++;
+                setScriptBatchProgress({ current: completed, total: batches.length });
               }
-              if (!sharedHero) sharedHero = batchRes.heroMaster;
-              allBlocks.push(...batchRes.blocks);
+            });
+            await Promise.all(runners);
+            for (let i = 1; i < batches.length; i++) {
+              const rr = restResults[i];
+              if (!rr) continue;
+              if (rr.ok) allBlocks.push(...rr.blocks);
+              else {
+                return { blocks: allBlocks, heroMaster: sharedHero, isSimulated: false, error: `сегмент ${rr.batchIdx + 1} из ${batches.length}: ${rr.error}`, partial: true };
+              }
             }
             return { blocks: allBlocks, heroMaster: sharedHero, isSimulated: false };
           })()
@@ -567,19 +596,28 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
     let expandedScenes = splitScenesByDurationCap(scenesWithDurations);
 
     if (blocks && blocks.length === scenesWithDurations.length) {
-      showToast(`🎨 Раскадровываю микро-биты внутри длинных блоков (это ещё ~30 сек)…`);
-      const rebuilt: StoryScene[] = [];
+      // Pre-compute each block's slice on the timeline so we can fetch all
+      // micro-beats IN PARALLEL — the blocks are independent, so waiting for
+      // each ~15-30s Gemini call one at a time was turning 14 blocks into
+      // 3-7 min of wall time for no reason. Cap concurrency so we don't hit
+      // Gemini's per-minute rate limit.
+      const CONCURRENCY = 4;
+      const tasks: Array<{ blockIdx: number; sliceStart: number; sliceLen: number }> = [];
       let cursor = 0;
       for (let bi = 0; bi < scenesWithDurations.length; bi++) {
-        const block = blocks[bi];
         const parentDur = scenesWithDurations[bi].duration;
         const subshotCount = Math.max(1, Math.min(12, Math.floor(parentDur / 4)));
-        const slice = expandedScenes.slice(cursor, cursor + Math.max(1, subshotCount));
-        cursor += slice.length;
-        if (slice.length <= 1 || !block?.nineFields) {
-          rebuilt.push(...slice);
-          continue;
-        }
+        const sliceLen = Math.max(1, subshotCount);
+        tasks.push({ blockIdx: bi, sliceStart: cursor, sliceLen });
+        cursor += sliceLen;
+      }
+      const microbeatSlots: (typeof expandedScenes) = expandedScenes.map((s) => ({ ...s }));
+      let doneCount = 0;
+      const parallelizable = tasks.filter((t) => t.sliceLen > 1 && blocks[t.blockIdx]?.nineFields);
+      showToast(`🎨 Раскадровываю микро-биты (${parallelizable.length} длинных блоков, параллельно по ${CONCURRENCY})…`);
+
+      const runOne = async (task: typeof tasks[number]) => {
+        const block = blocks[task.blockIdx];
         try {
           const mb = await generateMicrobeatsReal({
             scriptLine: block.scriptLine,
@@ -590,23 +628,31 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
               clothing: heroMaster.clothing,
               keyFeature: heroMaster.keyFeature,
             },
-            subshotCount: slice.length,
+            subshotCount: task.sliceLen,
             language: scriptLanguage,
           });
-          if (mb.beats && mb.beats.length === slice.length) {
-            slice.forEach((sc, i) => {
-              const prompt = compileNineFieldsPrompt(mb.beats![i], heroMaster.name);
-              rebuilt.push({ ...sc, prompt });
-            });
-          } else {
-            rebuilt.push(...slice);
+          if (mb.beats && mb.beats.length === task.sliceLen) {
+            for (let i = 0; i < task.sliceLen; i++) {
+              const prompt = compileNineFieldsPrompt(mb.beats[i], heroMaster.name);
+              microbeatSlots[task.sliceStart + i] = { ...microbeatSlots[task.sliceStart + i], prompt };
+            }
           }
-        } catch {
-          rebuilt.push(...slice);
+        } catch { /* leave the slice as-is; the per-shot angle prompt still stands */ }
+        doneCount++;
+        if (doneCount % 3 === 0) setScriptBatchProgress({ current: doneCount, total: parallelizable.length });
+      };
+
+      // Simple concurrency pool: N runners pull from the task queue until empty.
+      const queue = [...parallelizable];
+      const runners = Array.from({ length: Math.min(CONCURRENCY, queue.length) }, async () => {
+        while (queue.length > 0) {
+          const t = queue.shift();
+          if (t) await runOne(t);
         }
-      }
-      // Renumber ids and clean the confusing "(ракурс N/M)" suffix from titles.
-      expandedScenes = rebuilt.map((s, idx) => ({
+      });
+      await Promise.all(runners);
+
+      expandedScenes = microbeatSlots.map((s, idx) => ({
         ...s,
         id: idx + 1,
         title: s.title.replace(/\s*\(ракурс\s+\d+\/\d+\)\s*$/, ''),
