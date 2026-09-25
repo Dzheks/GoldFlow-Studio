@@ -61,7 +61,14 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
 
   // Timeline & Selection state
   const [clips, setClips] = useState<TimelineClip[]>(project.timelineClips);
-  const [selectedClipId, setSelectedClipId] = useState<string | null>('clip-v1');
+  // Multi-select support: Set for click-toggle with Ctrl/Cmd, Shift-range on a
+  // single track, "Delete" removes them all in one go. selectedClipId (the
+  // last one added) still drives the single-clip inspector on the right.
+  const [selectedClipIds, setSelectedClipIds] = useState<Set<string>>(new Set(['clip-v1']));
+  const selectedClipId: string | null = selectedClipIds.size > 0 ? Array.from(selectedClipIds).pop()! : null;
+  const setSelectedClipId = (id: string | null) => {
+    setSelectedClipIds(id ? new Set([id]) : new Set());
+  };
   const [timelineZoom, setTimelineZoom] = useState<number>(1.0); // 1.0 = normal
   const [isExporting, setIsExporting] = useState<boolean>(false);
   const [exportProgress, setExportProgress] = useState<number>(0);
@@ -245,7 +252,7 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
       if (e.code === 'Space') {
         e.preventDefault();
         setIsPlaying(prev => !prev);
-      } else if (e.code === 'KeyS' && !e.ctrlKey) {
+      } else if (e.code === 'KeyS' && !e.ctrlKey && !e.metaKey) {
         e.preventDefault();
         handleSplitClipAtPlayhead();
       } else if (e.code === 'ArrowRight') {
@@ -254,6 +261,15 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
       } else if (e.code === 'ArrowLeft') {
         e.preventDefault();
         setCurrentTime(t => Math.max(0, t - (e.shiftKey ? 1.0 : 1 / fps)));
+      } else if (e.code === 'Delete' || e.code === 'Backspace') {
+        e.preventDefault();
+        handleDeleteSelected();
+      } else if (e.code === 'Escape') {
+        e.preventDefault();
+        setSelectedClipIds(new Set());
+      } else if (e.code === 'KeyA' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        setSelectedClipIds(new Set(clips.map((c) => c.id)));
       }
     };
     window.addEventListener('keydown', handleKeyDown);
@@ -436,6 +452,46 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
     return `${mins}:${secs.toString().padStart(2, '0')}.${ms.toString().padStart(2, '0')}`;
   };
 
+  // Multi-select click handler for timeline clips.
+  //   plain click  → replace selection with this clip
+  //   Ctrl/Cmd    → toggle this clip in the current selection
+  //   Shift       → range-select from the previous last-selected to this one,
+  //                 within the same track (order = startTime).
+  const handleClipClick = (clip: TimelineClip, e: React.MouseEvent) => {
+    if (e.metaKey || e.ctrlKey) {
+      setSelectedClipIds((prev) => {
+        const next = new Set(prev);
+        if (next.has(clip.id)) next.delete(clip.id);
+        else next.add(clip.id);
+        return next;
+      });
+      return;
+    }
+    if (e.shiftKey && selectedClipId) {
+      const anchor = clips.find((c) => c.id === selectedClipId);
+      if (anchor && anchor.trackId === clip.trackId) {
+        const trackClips = clips.filter((c) => c.trackId === clip.trackId).sort((a, b) => a.startTime - b.startTime);
+        const aIdx = trackClips.findIndex((c) => c.id === anchor.id);
+        const bIdx = trackClips.findIndex((c) => c.id === clip.id);
+        const [lo, hi] = aIdx < bIdx ? [aIdx, bIdx] : [bIdx, aIdx];
+        setSelectedClipIds(new Set(trackClips.slice(lo, hi + 1).map((c) => c.id)));
+        return;
+      }
+    }
+    setSelectedClipIds(new Set([clip.id]));
+  };
+
+  // Delete selected clips (multi- or single-). The single continuous narration
+  // clip is protected — deleting it silently would break preview audio.
+  const handleDeleteSelected = () => {
+    if (selectedClipIds.size === 0) return;
+    const removable = clips.filter((c) => selectedClipIds.has(c.id) && !(c.trackId === 'voice' && !!c.audioUrl));
+    if (removable.length === 0) return;
+    const removableIds = new Set(removable.map((c) => c.id));
+    setClips(clips.filter((c) => !removableIds.has(c.id)));
+    setSelectedClipIds(new Set());
+  };
+
   return (
     <div className="min-h-screen bg-[#0e0b08] text-stone-200 flex flex-col select-none">
       {/* Hidden real-narration audio element: play/pause/seek is driven by the
@@ -471,17 +527,23 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
             >
               {ASPECT_RATIO_OPTIONS.map((r) => (
                 <option key={r.id} value={r.id} className="bg-[#1a140f] text-white">
-                  {r.label} ({r.code})
+                  {r.label}
                 </option>
               ))}
             </select>
           </div>
 
-          {/* Preset */}
+          {/* Preset — switching a preset also sets the matching aspect ratio */}
           <div className="flex items-center gap-1 bg-[#1a140f] px-2 py-1 rounded border border-[#302316]">
             <select
               value={preset}
-              onChange={(e) => setPreset(e.target.value)}
+              onChange={(e) => {
+                const p = e.target.value;
+                setPreset(p);
+                const wantVertical = p === 'YouTube Shorts' || p === 'Reels / TikTok' || p === 'VK Клипы';
+                const next: AspectRatioKey = wantVertical ? '9:16' : '16:9';
+                if (next !== aspectRatio) { setAspectRatio(next); onUpdateProject({ aspectRatio: next }); }
+              }}
               className="bg-transparent text-stone-200 text-xs focus:outline-none"
             >
               <option value="YouTube — обычное видео">YouTube — обычное видео</option>
@@ -495,16 +557,27 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
           <div className="flex items-center gap-1 bg-[#1a140f] px-2 py-1 rounded border border-[#302316]">
             <select
               value={fps}
-              onChange={(e) => setFps(Number(e.target.value))}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                setFps(v);
+                onUpdateProject({ fps: v });
+              }}
               className="bg-transparent text-stone-200 text-xs focus:outline-none"
             >
+              <option value={24}>24 к/с</option>
               <option value={30}>30 к/с</option>
               <option value={60}>60 к/с</option>
             </select>
           </div>
 
           <button
-            onClick={() => alert('Проект успешно сохранен!')}
+            onClick={() => {
+              onUpdateProject({
+                aspectRatio, fps, preset,
+                autoTransitions, syncWithVoice, clipHoldDuration, transitionDuration,
+                bgMusicVolume: duckingLevel, timelineClips: clips, duration: totalDuration,
+              });
+            }}
             className="px-3 py-1 rounded bg-[#241a10] hover:bg-[#322417] text-stone-200 border border-[#3c2b1d] transition-colors"
           >
             Сохранить
@@ -803,14 +876,14 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
         <div className="col-span-12 md:col-span-6 bg-[#0a0806] flex flex-col justify-between p-3 relative">
           {/* Canvas Viewport with Framing Box — shrank to fit 1080p laptops
               without vertical scroll (was 620/380/500 max, ~25% smaller now). */}
-          <div className="flex-1 flex items-center justify-center relative min-h-[220px]">
+          <div className="flex-1 flex items-center justify-center relative min-h-[180px]">
             <div
               className={`relative border-2 border-dashed border-[#57432b] rounded-lg overflow-hidden shadow-2xl transition-all ${
-                aspectRatio === '16:9' ? 'w-full max-w-[460px] aspect-video' :
-                aspectRatio === '9:16' ? 'h-full max-h-[300px] aspect-[9/16]' :
-                aspectRatio === '4:3' ? 'w-full max-w-[380px] aspect-[4/3]' :
-                aspectRatio === '3:4' ? 'h-full max-h-[300px] aspect-[3/4]' :
-                'w-full max-w-[300px] aspect-square'
+                aspectRatio === '16:9' ? 'w-full max-w-[360px] aspect-video' :
+                aspectRatio === '9:16' ? 'h-full max-h-[240px] aspect-[9/16]' :
+                aspectRatio === '4:3' ? 'w-full max-w-[300px] aspect-[4/3]' :
+                aspectRatio === '3:4' ? 'h-full max-h-[240px] aspect-[3/4]' :
+                'w-full max-w-[240px] aspect-square'
               }`}
             >
               <canvas
@@ -1223,13 +1296,24 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
               className="w-24 accent-amber-500 h-1 bg-[#251c14] rounded cursor-pointer"
             />
           </div>
-          <div className="text-[11px] text-stone-500">
-            Материалы перетаскиваются на дорожки мыслью и курсором
+          <div className="flex items-center gap-3 text-[11px] text-stone-500">
+            {selectedClipIds.size > 0 ? (
+              <>
+                <span className="text-amber-300 font-mono">Выделено: {selectedClipIds.size}</span>
+                <button onClick={handleDeleteSelected} className="text-rose-300 hover:text-rose-200 font-mono underline">Удалить (Del)</button>
+                <button onClick={() => setSelectedClipIds(new Set())} className="text-stone-400 hover:text-white font-mono underline">Снять (Esc)</button>
+              </>
+            ) : (
+              <span>Ctrl+клик — добавить; Shift+клик — диапазон; Ctrl+A — всё; Del — удалить</span>
+            )}
           </div>
         </div>
 
-        {/* Tracks Canvas & Grid */}
-        <div className="relative bg-[#0c0907] border border-[#241a12] rounded-xl p-2 overflow-x-auto min-h-[170px]">
+        {/* Tracks Canvas & Grid — click on empty area to deselect all clips */}
+        <div
+          onClick={(e) => { if (e.target === e.currentTarget) setSelectedClipIds(new Set()); }}
+          className="relative bg-[#0c0907] border border-[#241a12] rounded-xl p-2 overflow-x-auto min-h-[170px]"
+        >
           {/* Moving Playhead Scrubber Red Line */}
           <div
             className="absolute top-0 bottom-0 w-[2px] bg-amber-400 z-30 pointer-events-none transition-all shadow-[0_0_8px_rgba(245,158,11,0.8)]"
@@ -1259,12 +1343,12 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
                 .map((clip) => {
                   const left = (clip.startTime / totalDuration) * 920 * timelineZoom;
                   const width = (clip.duration / totalDuration) * 920 * timelineZoom;
-                  const isSelected = clip.id === selectedClipId;
+                  const isSelected = selectedClipIds.has(clip.id);
 
                   return (
                     <div
                       key={clip.id}
-                      onClick={() => setSelectedClipId(clip.id)}
+                      onClick={(e) => handleClipClick(clip, e)}
                       className={`absolute top-0 bottom-0 rounded-md px-1.5 flex items-center justify-between text-[11px] font-semibold truncate cursor-pointer transition-all border ${
                         isSelected
                           ? 'border-amber-400 ring-2 ring-amber-400/40 z-20 text-white shadow-lg'
@@ -1307,12 +1391,12 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
                 .map((clip) => {
                   const left = (clip.startTime / totalDuration) * 920 * timelineZoom;
                   const width = (clip.duration / totalDuration) * 920 * timelineZoom;
-                  const isSelected = clip.id === selectedClipId;
+                  const isSelected = selectedClipIds.has(clip.id);
 
                   return (
                     <div
                       key={clip.id}
-                      onClick={() => setSelectedClipId(clip.id)}
+                      onClick={(e) => handleClipClick(clip, e)}
                       className={`absolute top-0 bottom-0 rounded-md px-2 flex items-center justify-between text-[11px] font-semibold truncate cursor-pointer border ${
                         isSelected
                           ? 'border-sky-400 ring-2 ring-sky-400/40 z-20 text-white'
@@ -1382,7 +1466,7 @@ export const MontageStudio: React.FC<MontageStudioProps> = ({
                   return (
                     <div
                       key={clip.id}
-                      onClick={() => setSelectedClipId(clip.id)}
+                      onClick={(e) => handleClipClick(clip, e)}
                       className="absolute top-0 bottom-0 rounded-md px-2 flex items-center justify-between text-[11px] font-semibold truncate border border-rose-700 text-rose-100 bg-[#991b1b] cursor-pointer"
                       style={{
                         left: `${left}px`,
