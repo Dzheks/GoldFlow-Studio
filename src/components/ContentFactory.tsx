@@ -61,6 +61,28 @@ interface ContentFactoryProps {
   onDeductCredits: (amount: number) => boolean;
 }
 
+// Authoritative real narration length: load the actual mp3 and read its
+// duration. Lumean's reported durationMs/cues are sometimes missing or wrong,
+// but the audio file itself never lies. Resolves 0 if it can't be measured.
+function measureAudioDurationSec(url: string): Promise<number> {
+  return new Promise((resolve) => {
+    try {
+      const audio = new Audio();
+      audio.preload = 'metadata';
+      const done = (v: number) => { audio.src = ''; resolve(v); };
+      const timer = setTimeout(() => done(0), 15000);
+      audio.addEventListener('loadedmetadata', () => {
+        clearTimeout(timer);
+        done(Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0);
+      });
+      audio.addEventListener('error', () => { clearTimeout(timer); done(0); });
+      audio.src = url;
+    } catch {
+      resolve(0);
+    }
+  });
+}
+
 export const ContentFactory: React.FC<ContentFactoryProps> = ({
   project,
   onUpdateProject,
@@ -385,9 +407,12 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
         if (voiceRes.audioUrl) {
           narrationAudioUrl = voiceRes.audioUrl;
           const cues = voiceRes.cues || [];
-          // Real total spoken length: audio file duration first, else the last
+          // Real total spoken length, most-trustworthy source first: the actual
+          // mp3's own duration, then Lumean's reported durationMs, then the last
           // SRT cue's end. This is the number the whole video MUST match.
+          const measuredSec = await measureAudioDurationSec(voiceRes.audioUrl);
           const realTotalSec =
+            measuredSec ||
             (voiceRes.durationMs ? voiceRes.durationMs / 1000 : 0) ||
             (cues.length ? cues[cues.length - 1].endSec : 0);
 
