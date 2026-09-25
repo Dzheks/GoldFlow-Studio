@@ -2305,64 +2305,55 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
                   Пусто. Запусти пачку с выбранным проектом — результаты лягут сюда сами. Или добавь готовое из «Моих работ».
                 </p>
               ) : (
-                <div className="space-y-2.5 max-h-[520px] overflow-y-auto pr-1">
+                <div className="space-y-1 max-h-[520px] overflow-y-auto pr-1">
                   {project.scenes.map((sc) => (
                     <div
                       key={sc.id}
-                      className="rounded-xl overflow-hidden bg-[#0f0b08] border border-[#2b2116] hover:border-amber-500/40 transition-colors"
+                      className="flex items-center gap-2 p-1.5 rounded-lg bg-[#0f0b08] border border-[#2b2116] hover:border-amber-500/40 transition-colors"
                     >
                       <div
                         onClick={() => sc.generatedImageUrl && setPreviewScene(sc)}
-                        className={`relative aspect-video group ${sc.generatedImageUrl ? 'cursor-pointer' : ''}`}
+                        className={`relative w-12 h-12 shrink-0 rounded-md overflow-hidden group ${sc.generatedImageUrl ? 'cursor-pointer' : ''}`}
                         title={sc.generatedImageUrl ? `План ${sc.id} — открыть превью` : `План ${sc.id} — ждёт генерации`}
                       >
                         {sc.generatedImageUrl ? (
-                          <>
-                            <img src={sc.generatedImageUrl} alt={`План ${sc.id}`} className="w-full h-full object-cover" />
-                            <div className="absolute inset-0 bg-black/0 group-hover:bg-black/30 transition-colors flex items-center justify-center">
-                              <span className="opacity-0 group-hover:opacity-100 text-[10px] text-white font-mono transition-opacity">Открыть превью</span>
-                            </div>
-                          </>
+                          <img src={sc.generatedImageUrl} alt={`План ${sc.id}`} className="w-full h-full object-cover" />
                         ) : (
-                          <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#0b0806] gap-1">
-                            {isBatchGenerating ? <RefreshCw className="w-3.5 h-3.5 text-amber-400 animate-spin" /> : null}
-                            <span className="text-[10px] text-stone-500 font-mono">
-                              {isBatchGenerating ? 'Генерируется…' : 'Ждёт генерации'}
-                            </span>
+                          <div className="absolute inset-0 flex items-center justify-center bg-[#0b0806]">
+                            {isBatchGenerating
+                              ? <RefreshCw className="w-3 h-3 text-amber-400 animate-spin" />
+                              : <span className="text-[8px] text-stone-600 font-mono">#{sc.id}</span>}
                           </div>
                         )}
                         {regeneratingSceneId === sc.id && (
                           <div className="absolute inset-0 bg-black/70 flex items-center justify-center">
-                            <RefreshCw className="w-4 h-4 text-amber-400 animate-spin" />
+                            <RefreshCw className="w-3 h-3 text-amber-400 animate-spin" />
                           </div>
                         )}
                       </div>
-                      <div className="p-2.5 space-y-1.5">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-[11px] font-bold text-amber-400 font-mono shrink-0">
-                            План {sc.id}
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => handleRegenerateScene(sc.id)}
-                            disabled={regeneratingSceneId !== null || !sc.generatedImageUrl || isBatchGenerating}
-                            className="flex items-center gap-1 px-2 py-1 rounded-md bg-[#1c150e] hover:bg-[#2c2117] border border-[#382a1d] text-stone-300 hover:text-amber-300 text-[10px] font-mono transition-colors disabled:opacity-40 shrink-0"
-                            title={
-                              isBatchGenerating
-                                ? 'Идёт пачка — дождись окончания'
-                                : sc.generatedImageUrl
-                                ? 'Перегенерировать этот кадр'
-                                : 'Кадр ещё не сгенерирован'
-                            }
-                          >
-                            <RefreshCw className={`w-3 h-3 ${regeneratingSceneId === sc.id ? 'animate-spin' : ''}`} />
-                            <span>Перегенерировать</span>
-                          </button>
-                        </div>
-                        <p className="text-[11px] text-stone-400 leading-snug line-clamp-2">
+                      <div className="min-w-0 flex-1">
+                        <span className="text-[10px] font-bold text-amber-400 font-mono block">
+                          План {sc.id}
+                        </span>
+                        <p className="text-[11px] text-stone-400 leading-snug line-clamp-1">
                           {sc.description || sc.prompt}
                         </p>
                       </div>
+                      <button
+                        type="button"
+                        onClick={() => handleRegenerateScene(sc.id)}
+                        disabled={regeneratingSceneId !== null || !sc.generatedImageUrl || isBatchGenerating}
+                        className="p-1.5 rounded-md bg-[#1c150e] hover:bg-[#2c2117] border border-[#382a1d] text-stone-300 hover:text-amber-300 transition-colors disabled:opacity-40 shrink-0"
+                        title={
+                          isBatchGenerating
+                            ? 'Идёт пачка — дождись окончания'
+                            : sc.generatedImageUrl
+                            ? 'Перегенерировать этот кадр'
+                            : 'Кадр ещё не сгенерирован'
+                        }
+                      >
+                        <RefreshCw className={`w-3 h-3 ${regeneratingSceneId === sc.id ? 'animate-spin' : ''}`} />
+                      </button>
                     </div>
                   ))}
                 </div>
