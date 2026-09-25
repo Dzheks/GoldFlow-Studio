@@ -93,8 +93,11 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
   onDeductCredits,
 }) => {
   const [selectedStyleId, setSelectedStyleId] = useState<string>(project.styleId);
-  const [scriptTab, setScriptTab] = useState<'generate' | 'custom' | 'upload'>('generate');
+  const [scriptTab, setScriptTab] = useState<'generate' | 'custom' | 'upload' | 'lumean'>('generate');
   const [uploadedAudio, setUploadedAudio] = useState<{ base64: string; mimeType: string; name: string; objectUrl: string } | null>(null);
+  const [lumeanText, setLumeanText] = useState<string>('');
+  const [lumeanResult, setLumeanResult] = useState<import('../services/geminiPipelineClient').SynthesizeVoiceResult | null>(null);
+  const [isSynthesizing, setIsSynthesizing] = useState<boolean>(false);
   const [targetSeconds, setTargetSeconds] = useState<number>(60);
   const [customMin, setCustomMin] = useState<number>(1);
   const [customSec, setCustomSec] = useState<number>(0);
@@ -468,78 +471,193 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
         showToast(`⚠️ Озвучка не удалась (${err?.message || 'ошибка'}) — тайминг остался оценочным.`);
       }
 
-      // An AI "block" is grouped by scene change (place/time/character), NOT by
-      // duration — so one block can carry 40-60 sec of narration. Rendered as a
-      // single still it becomes one absurdly long Ken Burns pan, and an 11-min
-      // script collapses to ~14 shots. Split any block longer than one shot's
-      // worth of narration into equal sub-shots that share the same
-      // nineFields/hero/location but vary the camera angle, so runtime actually
-      // drives shot count (693 sec → ~170+ shots, not 14).
-      const TARGET_SHOT_SECONDS = 4;
-      // High enough that shot count is driven by real duration (total/4), not
-      // clipped — a long block (few-block script) still splits down to ~4s.
-      const MAX_SUBSHOTS = 40;
-      const CAMERA_ANGLES = [
-        'wide establishing shot', 'medium shot', 'close-up detail shot',
-        'over-the-shoulder angle', 'low-angle dramatic shot', 'high-angle overview',
-        'slow tracking side profile', 'reverse angle',
-      ];
-      const MOTION_CYCLE: StoryScene['motionType'][] = ['zoom-in', 'pan-left', 'zoom-out', 'pan-right'];
-      const expandedScenes: StoryScene[] = [];
-      newScenes.forEach((scene) => {
-        const n = Math.max(1, Math.min(MAX_SUBSHOTS, Math.round(scene.duration / TARGET_SHOT_SECONDS)));
-        if (n <= 1) {
-          expandedScenes.push(scene);
-          return;
-        }
-        const per = Number((scene.duration / n).toFixed(2));
-        for (let i = 0; i < n; i++) {
-          const angle = CAMERA_ANGLES[i % CAMERA_ANGLES.length];
-          expandedScenes.push({
-            ...scene,
-            id: 0,
-            title: `${scene.title} · ракурс ${i + 1}/${n}`,
-            duration: per,
-            prompt: `${scene.prompt}. Camera angle ${i + 1} of ${n} for this same moment: ${angle}`,
-            motionType: MOTION_CYCLE[i % MOTION_CYCLE.length],
-          });
-        }
-      });
-      expandedScenes.forEach((s, idx) => { s.id = idx + 1; });
-
-      // Rebuild the visible prompt list + montage from the real shot count.
-      const expandedPromptsText = expandedScenes.map((s, i) => `${i + 1}. ${s.prompt}`).join('\n');
-      setPromptsText(expandedPromptsText);
-      const finalTotalSec = Math.round(expandedScenes.reduce((a, s) => a + s.duration, 0));
-      showToast(`🎬 Итог: ${newScenes.length} сцен → ${expandedScenes.length} кадров, суммарно ${finalTotalSec} сек ролика.`);
-
-      const { timelineClips, totalDuration } = buildSynchronizedTimeline(expandedScenes, selectedRatio, selectedStyleId);
-      onUpdateProject({ scriptText: fullScript, scenes: expandedScenes, timelineClips, duration: totalDuration, narrationAudioUrl, heroName: res.heroMaster.name });
-
-      // Generate the hero reference image now, once — every scene in
-      // handleRunBatch reuses it for character consistency (п.04). It must
-      // go through the same custom style the user picked, or the portrait
-      // comes back in a different style than everything else in the batch.
-      try {
-        const activeCustomStyleForHero = customStyles.find((s) => s.id === selectedStyleId);
-        const heroPrompt = `Portrait of ${res.heroMaster.name}, ${res.heroMaster.appearance}, wearing: ${res.heroMaster.clothing}, key feature: ${res.heroMaster.keyFeature}. Cinematic lighting, 85mm portrait, consistent reference look, plain neutral background.`;
-        const heroImgRes = await generateImageReal({
-          prompt: activeCustomStyleForHero?.negativePrompt ? `${heroPrompt}. Avoid: ${activeCustomStyleForHero.negativePrompt}` : heroPrompt,
-          modelCode: selectedModel,
-          aspectRatio: '1:1',
-          styleReferenceImages: activeCustomStyleForHero?.referenceImages,
-        });
-        if (heroImgRes.imageBase64) {
-          const newHeroRef = { base64: heroImgRes.imageBase64, mimeType: heroImgRes.mimeType || 'image/png' };
-          setHeroRefImage(newHeroRef);
-          onUpdateProject({ heroRefImage: newHeroRef });
-          showToast(`🎬 Эталон героя «${res.heroMaster.name}» сгенерирован — будет использован для консистентности во всех кадрах.`);
-        }
-      } catch {
-        // non-fatal — batch generation still works without hero consistency
-      }
+      await finalizeAndCommit(newScenes, res.heroMaster, fullScript, narrationAudioUrl);
     } catch (err: any) {
       showToast(`❌ Ошибка генерации сценария: ${err?.message || 'неизвестная ошибка'}`);
+    } finally {
+      setIsGeneratingScript(false);
+      setScriptBatchProgress(null);
+    }
+  };
+
+  // Shared finalize step for every script mode: split each block into ~4s
+  // sub-shots (varying camera angle), rebuild the prompt list + montage, save
+  // the project, and generate the hero reference portrait once.
+  const finalizeAndCommit = async (
+    scenesWithDurations: StoryScene[],
+    heroMaster: GeneratedHero,
+    fullScript: string,
+    narrationAudioUrl: string | undefined,
+  ) => {
+    const TARGET_SHOT_SECONDS = 4;
+    const MAX_SUBSHOTS = 40;
+    const CAMERA_ANGLES = [
+      'wide establishing shot', 'medium shot', 'close-up detail shot',
+      'over-the-shoulder angle', 'low-angle dramatic shot', 'high-angle overview',
+      'slow tracking side profile', 'reverse angle',
+    ];
+    const MOTION_CYCLE: StoryScene['motionType'][] = ['zoom-in', 'pan-left', 'zoom-out', 'pan-right'];
+    const expandedScenes: StoryScene[] = [];
+    scenesWithDurations.forEach((scene) => {
+      const n = Math.max(1, Math.min(MAX_SUBSHOTS, Math.round(scene.duration / TARGET_SHOT_SECONDS)));
+      if (n <= 1) {
+        expandedScenes.push(scene);
+        return;
+      }
+      const per = Number((scene.duration / n).toFixed(2));
+      for (let i = 0; i < n; i++) {
+        const angle = CAMERA_ANGLES[i % CAMERA_ANGLES.length];
+        expandedScenes.push({
+          ...scene,
+          id: 0,
+          title: `${scene.title} · ракурс ${i + 1}/${n}`,
+          duration: per,
+          prompt: `${scene.prompt}. Camera angle ${i + 1} of ${n} for this same moment: ${angle}`,
+          motionType: MOTION_CYCLE[i % MOTION_CYCLE.length],
+        });
+      }
+    });
+    expandedScenes.forEach((s, idx) => { s.id = idx + 1; });
+
+    const expandedPromptsText = expandedScenes.map((s, i) => `${i + 1}. ${s.prompt}`).join('\n');
+    setPromptsText(expandedPromptsText);
+    const finalTotalSec = Math.round(expandedScenes.reduce((a, s) => a + s.duration, 0));
+    showToast(`🎬 Итог: ${scenesWithDurations.length} сцен → ${expandedScenes.length} кадров, суммарно ${finalTotalSec} сек ролика.`);
+
+    const { timelineClips, totalDuration } = buildSynchronizedTimeline(expandedScenes, selectedRatio, selectedStyleId);
+    onUpdateProject({ scriptText: fullScript, scenes: expandedScenes, timelineClips, duration: totalDuration, narrationAudioUrl, heroName: heroMaster.name });
+
+    try {
+      const activeCustomStyleForHero = customStyles.find((s) => s.id === selectedStyleId);
+      const heroPrompt = `Portrait of ${heroMaster.name}, ${heroMaster.appearance}, wearing: ${heroMaster.clothing}, key feature: ${heroMaster.keyFeature}. Cinematic lighting, 85mm portrait, consistent reference look, plain neutral background.`;
+      const heroImgRes = await generateImageReal({
+        prompt: activeCustomStyleForHero?.negativePrompt ? `${heroPrompt}. Avoid: ${activeCustomStyleForHero.negativePrompt}` : heroPrompt,
+        modelCode: selectedModel,
+        aspectRatio: '1:1',
+        styleReferenceImages: activeCustomStyleForHero?.referenceImages,
+      });
+      if (heroImgRes.imageBase64) {
+        const newHeroRef = { base64: heroImgRes.imageBase64, mimeType: heroImgRes.mimeType || 'image/png' };
+        setHeroRefImage(newHeroRef);
+        onUpdateProject({ heroRefImage: newHeroRef });
+        showToast(`🎬 Эталон героя «${heroMaster.name}» сгенерирован — будет использован для консистентности во всех кадрах.`);
+      }
+    } catch {
+      // non-fatal — batch generation still works without hero consistency
+    }
+  };
+
+  // Lumean tab, step 1: synthesize the pasted tagged text into real audio +
+  // pause-accurate subtitle timecodes. Nothing is split yet — the user reviews
+  // the mp3/subs, then presses "собрать промпты по таймкодам".
+  const handleSynthesizeLumean = async () => {
+    if (!lumeanText.trim()) {
+      showToast('Сначала вставь текст озвучки (можно с тегами [pause], [somber] и т.д.)');
+      return;
+    }
+    setIsSynthesizing(true);
+    setLumeanResult(null);
+    try {
+      showToast('🎙️ Отправляю текст в Lumean на озвучку — это может занять до 2 минут…');
+      const voiceRes = await synthesizeVoiceReal({ text: lumeanText, langCode: scriptLanguage });
+      if (voiceRes.error || !voiceRes.audioUrl) {
+        showToast(`❌ Озвучка не удалась (${voiceRes.error || 'нет аудио'})`);
+        return;
+      }
+      setLumeanResult(voiceRes);
+      const totalSec = voiceRes.durationMs ? Math.round(voiceRes.durationMs / 1000) : (voiceRes.cues?.length ? Math.round(voiceRes.cues[voiceRes.cues.length - 1].endSec) : 0);
+      showToast(`✅ Озвучка готова: ${totalSec} сек, ${voiceRes.cues?.length || 0} таймкод-сегментов. Можно скачать mp3/SRT и собрать промпты.`);
+    } catch (err: any) {
+      showToast(`❌ Ошибка озвучки (${err?.message || 'сбой'})`);
+    } finally {
+      setIsSynthesizing(false);
+    }
+  };
+
+  // Lumean tab, step 2: build prompts and split shots by the REAL Lumean SRT
+  // timecodes (pause-accurate), not by estimate. Each block's duration comes
+  // from where its cues actually fall on the audio timeline.
+  const handleBuildFromLumean = async () => {
+    if (!lumeanResult?.cues?.length) {
+      showToast('Сначала озвучь текст — нужны таймкоды из Lumean');
+      return;
+    }
+    const cues = lumeanResult.cues;
+    const totalSec = lumeanResult.durationMs ? lumeanResult.durationMs / 1000 : cues[cues.length - 1].endSec;
+
+    setIsGeneratingScript(true);
+    setScriptBatchProgress(null);
+    try {
+      // Director pass on the cue texts (same custom pipeline), so each block
+      // carries sourceLineIndices back to the exact cues it covers.
+      const CUSTOM_BATCH_SIZE = 20;
+      const lines = cues.map((c) => c.text);
+      const batches: string[][] = [];
+      for (let i = 0; i < lines.length; i += CUSTOM_BATCH_SIZE) batches.push(lines.slice(i, i + CUSTOM_BATCH_SIZE));
+      const allBlocks: GeneratedBlock[] = [];
+      let sharedHero: GeneratedHero | undefined;
+      let lineOffset = 0;
+      for (let b = 0; b < batches.length; b++) {
+        setScriptBatchProgress({ current: b + 1, total: batches.length });
+        const batchRes = await generateScriptReal({
+          mode: 'custom',
+          scriptLines: batches[b],
+          topicPrompt: customContextHint.trim() || undefined,
+          heroOverride: sharedHero?.name,
+          language: scriptLanguage,
+        });
+        if (batchRes.isSimulated || !batchRes.blocks?.length || !batchRes.heroMaster) {
+          if (allBlocks.length === 0) {
+            showToast(`❌ Не удалось разобрать текст на кадры (${batchRes.error || 'нет ответа'})`);
+            return;
+          }
+          showToast(`⚠️ Собрано частично: ${allBlocks.length} блоков, дальше остановилось. Уже готовое не потеряно.`);
+          break;
+        }
+        if (!sharedHero) sharedHero = batchRes.heroMaster;
+        // Shift each block's 1-based indices into the global cue list.
+        batchRes.blocks.forEach((blk) => {
+          allBlocks.push({ ...blk, sourceLineIndices: (blk.sourceLineIndices || []).map((n) => n + lineOffset) });
+        });
+        lineOffset += batches[b].length;
+      }
+      if (!sharedHero || allBlocks.length === 0) {
+        showToast('❌ Не удалось собрать блоки из озвучки');
+        return;
+      }
+
+      // Real, pause-accurate block durations from the cue timeline: each block
+      // spans from its first cue's start to the next block's first cue start;
+      // the last block runs to the end of the audio. This tiles the whole
+      // timeline including the silences Lumean placed for [pause] tags.
+      const blockStarts = allBlocks.map((blk) => {
+        const idxs = (blk.sourceLineIndices || []).filter((n) => n >= 1 && n <= cues.length);
+        const firstCue = idxs.length ? cues[Math.min(...idxs) - 1] : undefined;
+        return firstCue ? firstCue.startSec : 0;
+      });
+      const generatedPrompts = allBlocks.map((b) => compileNineFieldsPrompt(b.nineFields, sharedHero!.name));
+      const fullScript = allBlocks.map((b) => b.scriptLine).join('\n\n');
+      setScriptTopic(fullScript);
+      setHeroName(sharedHero.name);
+
+      const newScenes: StoryScene[] = allBlocks.map((b, idx) => ({
+        id: idx + 1,
+        title: `План 0${idx + 1}: ${b.scriptLine.slice(0, 28)}...`,
+        duration: Number((( idx + 1 < blockStarts.length ? blockStarts[idx + 1] : totalSec) - blockStarts[idx]).toFixed(2)),
+        description: b.scriptLine,
+        prompt: generatedPrompts[idx],
+        generatedImageUrl: undefined,
+        motionType: b.motionType,
+        transition: 'crossfade',
+      }));
+      // Guard against any non-positive span (out-of-order cues) — fall back to a
+      // small floor so the shot still exists.
+      newScenes.forEach((s) => { if (!(s.duration > 0)) s.duration = 4; });
+
+      showToast(`🎬 Тайминг взят из реальных таймкодов Lumean (${Math.round(totalSec)} сек, ${allBlocks.length} блоков) — режу по паузам.`);
+      await finalizeAndCommit(newScenes, sharedHero, fullScript, lumeanResult.audioUrl);
+    } catch (err: any) {
+      showToast(`❌ Ошибка сборки (${err?.message || 'сбой'})`);
     } finally {
       setIsGeneratingScript(false);
       setScriptBatchProgress(null);
@@ -1069,6 +1187,8 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
                     ? `${customScriptLines.length} сцены из текста`
                     : scriptTab === 'upload'
                     ? (uploadedAudio ? 'аудио загружено' : 'аудио не выбрано')
+                    : scriptTab === 'lumean'
+                    ? (lumeanResult?.cues?.length ? `${lumeanResult.cues.length} таймкодов` : 'текст → озвучка')
                     : `${estimatedSceneCount} сцен по ${SECONDS_PER_SCENE} с`}
                 </span>
               </div>
@@ -1105,6 +1225,16 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
                     }`}
                   >
                     Загрузить свою озвучку
+                  </button>
+                  <button
+                    onClick={() => setScriptTab('lumean')}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                      scriptTab === 'lumean'
+                        ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                        : 'bg-[#1a130e] text-stone-400 hover:text-white border border-[#2e2216]'
+                    }`}
+                  >
+                    Озвучить текст (Lumean)
                   </button>
                 </div>
 
@@ -1279,7 +1409,7 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
                     </button>
                   </div>
                 </>
-              ) : (
+              ) : scriptTab === 'upload' ? (
                 <>
                   {/* Upload mode: user's own voiceover → transcribe → same pipeline */}
                   <label className="block cursor-pointer">
@@ -1357,6 +1487,82 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
                           <Sparkles className="w-3.5 h-3.5" />
                           <span>Расшифровать и собрать сценарий</span>
                         </>
+                      )}
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  {/* Lumean mode: tagged text → real synth → pause-accurate timecodes → prompts */}
+                  <textarea
+                    value={lumeanText}
+                    onChange={(e) => setLumeanText(e.target.value)}
+                    rows={7}
+                    placeholder={"Вставь готовый текст озвучки — можно с тегами.\n\n[serious] Это была самая холодная зима за сто лет. [pause] Никто не ждал того, что случилось дальше.\n[somber] К утру деревня опустела."}
+                    className="w-full bg-[#1a130e] border border-[#302418] rounded-xl p-3 text-xs md:text-sm text-stone-200 placeholder-stone-600 focus:outline-none focus:border-amber-500/70 font-mono leading-relaxed"
+                  />
+                  <p className="text-[10px] text-stone-500 leading-relaxed">
+                    Lumean озвучит текст (теги вроде [pause]/[somber] влияют на интонацию и паузы), вернёт mp3 и точные таймкоды-субтитры. Кадры порежутся по этим РЕАЛЬНЫМ таймкодам — граница кадра садится на реальную паузу, а не на оценку. Дальше та же логика: ~4 сек на кадр, эталон героя, промпты по 9 полям.
+                  </p>
+
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-mono uppercase text-stone-400">Язык:</span>
+                    <select
+                      value={scriptLanguage}
+                      onChange={(e) => setScriptLanguage(e.target.value)}
+                      className="bg-[#1a130e] border border-[#2e2217] rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none"
+                    >
+                      {ELEVEN_LANGUAGES.map((l) => (
+                        <option key={l.id} value={l.id}>по-{l.nativeName.toLowerCase()}</option>
+                      ))}
+                    </select>
+                    <button
+                      onClick={handleSynthesizeLumean}
+                      disabled={isSynthesizing || isGeneratingScript || !lumeanText.trim()}
+                      className="ml-auto px-4 py-2 rounded-xl bg-[#1f1710] hover:bg-[#2c2117] text-amber-300 font-semibold text-xs border border-amber-500/40 flex items-center gap-2 transition-colors disabled:opacity-50"
+                    >
+                      {isSynthesizing ? (
+                        <><RefreshCw className="w-3.5 h-3.5 animate-spin" /><span>Озвучиваю… (до 2 мин)</span></>
+                      ) : (
+                        <><Sparkles className="w-3.5 h-3.5" /><span>1. Озвучить через Lumean</span></>
+                      )}
+                    </button>
+                  </div>
+
+                  {lumeanResult?.audioUrl && (
+                    <div className="p-3 rounded-xl bg-[#12100b] border border-emerald-500/25 space-y-2">
+                      <p className="text-[11px] text-emerald-300 font-mono">
+                        🎙️ Озвучка готова: {lumeanResult.durationMs ? Math.round(lumeanResult.durationMs / 1000) : (lumeanResult.cues?.length ? Math.round(lumeanResult.cues[lumeanResult.cues.length - 1].endSec) : 0)} сек, {lumeanResult.cues?.length || 0} таймкод-сегментов.
+                      </p>
+                      <audio controls src={lumeanResult.audioUrl} className="w-full max-w-md" />
+                      <div className="flex flex-wrap gap-3 text-[11px]">
+                        <a href={lumeanResult.audioUrl} download="voiceover.mp3" className="text-amber-300 hover:text-amber-200 underline">Скачать mp3</a>
+                        {lumeanResult.srtUrl && <a href={lumeanResult.srtUrl} download="subtitles.srt" className="text-amber-300 hover:text-amber-200 underline">Скачать таймкоды (SRT)</a>}
+                        {lumeanResult.vttUrl && <a href={lumeanResult.vttUrl} download="subtitles.vtt" className="text-amber-300 hover:text-amber-200 underline">Скачать субтитры (VTT)</a>}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="flex flex-wrap items-center justify-between gap-4 pt-1">
+                    <span className="text-[11px] text-stone-500 font-mono">
+                      {lumeanResult?.cues?.length ? 'Таймкоды получены — жми, чтобы собрать промпты и порезать кадры по паузам.' : 'Сначала озвучь текст (шаг 1).'}
+                    </span>
+                    <button
+                      onClick={handleBuildFromLumean}
+                      disabled={isGeneratingScript || isSynthesizing || !lumeanResult?.cues?.length}
+                      className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-amber-500 to-yellow-400 hover:from-amber-400 hover:to-yellow-300 text-black font-semibold text-xs transition-all shadow-md flex items-center gap-2 disabled:opacity-50"
+                    >
+                      {isGeneratingScript ? (
+                        <>
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                          <span>
+                            {scriptBatchProgress
+                              ? `Сегмент ${scriptBatchProgress.current} из ${scriptBatchProgress.total}... ${scriptGenElapsed}с`
+                              : `Собираю кадры... ${scriptGenElapsed}с`}
+                          </span>
+                        </>
+                      ) : (
+                        <><Sparkles className="w-3.5 h-3.5" /><span>2. Собрать промпты по таймкодам</span></>
                       )}
                     </button>
                   </div>

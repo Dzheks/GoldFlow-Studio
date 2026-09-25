@@ -24,6 +24,8 @@ export interface GeneratedBlock {
   scriptLine: string;
   nineFields: NineFieldsResult;
   motionType: 'zoom-in' | 'zoom-out' | 'pan-left' | 'pan-right' | 'static';
+  // 1-based indices of the source lines this block covers (custom/upload mode).
+  sourceLineIndices?: number[];
 }
 
 export interface GeneratedHero {
@@ -127,6 +129,9 @@ export interface SynthesizeVoiceResult {
   audioUrl?: string;
   durationMs?: number | null;
   cues?: { index: number; startSec: number; endSec: number; text: string }[];
+  srtUrl?: string;
+  vttUrl?: string;
+  srtText?: string;
   error?: string;
 }
 

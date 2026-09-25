@@ -334,28 +334,37 @@ async function startServer() {
       }
       if (!completed) throw new Error('Озвучка не завершилась за 2 минуты ожидания');
 
+      const serviceFiles: string[] = completed.result?.service_files || [];
       const audioPath = completed.result?.files?.[0];
-      const srtPath = (completed.result?.service_files || []).find((p: string) => p.endsWith('subtitles.srt'));
+      const srtPath = serviceFiles.find((p) => p.endsWith('subtitles.srt'));
+      const vttPath = serviceFiles.find((p) => p.endsWith('subtitles.vtt'));
       if (!audioPath) throw new Error('Lumean не вернул аудиофайл');
 
-      const audioUrlData = await lumeanFetch('/storage/url', { method: 'POST', body: JSON.stringify({ path: audioPath }) });
+      const signUrl = async (p?: string) =>
+        p ? (await lumeanFetch('/storage/url', { method: 'POST', body: JSON.stringify({ path: p }) })).url as string : undefined;
+
+      const audioUrl = await signUrl(audioPath);
+      const srtUrl = await signUrl(srtPath);
+      const vttUrl = await signUrl(vttPath);
 
       let cues: { index: number; startSec: number; endSec: number; text: string }[] = [];
-      if (srtPath) {
-        const srtUrlData = await lumeanFetch('/storage/url', { method: 'POST', body: JSON.stringify({ path: srtPath }) });
-        const srtRes = await fetch(srtUrlData.url);
-        const srtText = await srtRes.text();
+      let srtText: string | undefined;
+      if (srtUrl) {
+        srtText = await (await fetch(srtUrl)).text();
         cues = parseSrt(srtText);
       }
 
       // Prefer Lumean's own number when present; otherwise measure the real
       // wall-clock length from the mp3 so the client can match the video to it.
-      const measuredMs = completed.total_duration_ms || (await measureMp3DurationMs(audioUrlData.url));
+      const measuredMs = completed.total_duration_ms || (await measureMp3DurationMs(audioUrl!));
 
       res.json({
-        audioUrl: audioUrlData.url,
+        audioUrl,
         durationMs: measuredMs || null,
         cues,
+        srtUrl,
+        vttUrl,
+        srtText,
       });
     } catch (err: any) {
       console.error('synthesize-voice error:', err);
@@ -525,6 +534,7 @@ async function startServer() {
           reconciled.push({
             ...b,
             scriptLine: indices.map((n) => translated[n - 1]).join(' '),
+            sourceLineIndices: indices, // authoritative mapping for timecode-driven timing
           });
         }
 
@@ -541,10 +551,12 @@ async function startServer() {
               nineFields: rawBlocks[0]?.nineFields,
               motionType: rawBlocks[0]?.motionType || 'static',
               scriptLine: missing.map((n) => translated[n - 1]).join(' '),
+              sourceLineIndices: missing,
             });
           } else {
             const last = reconciled[reconciled.length - 1];
             last.scriptLine = `${last.scriptLine} ${missing.map((n) => translated[n - 1]).join(' ')}`.trim();
+            last.sourceLineIndices = [...(last.sourceLineIndices || []), ...missing].sort((a: number, c: number) => a - c);
           }
         }
 
