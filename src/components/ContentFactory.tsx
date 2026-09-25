@@ -61,6 +61,27 @@ interface ContentFactoryProps {
   onDeductCredits: (amount: number) => boolean;
 }
 
+// Parse an SRT (or WebVTT — same block layout, "HH:MM:SS.ms" instead of ",")
+// into {index,startSec,endSec,text} cues. Anything unparsable is skipped.
+function parseSrtOrVttText(raw: string): { index: number; startSec: number; endSec: number; text: string }[] {
+  const toSec = (t: string) => {
+    const m = t.trim().match(/(\d+):(\d+):(\d+)[,.](\d+)/) || t.trim().match(/(\d+):(\d+)[,.](\d+)/);
+    if (!m) return 0;
+    if (m.length === 5) return +m[1] * 3600 + +m[2] * 60 + +m[3] + +m[4] / 1000;
+    return +m[1] * 60 + +m[2] + +m[3] / 1000;
+  };
+  const cleaned = raw.replace(/\r/g, '').replace(/^WEBVTT[^\n]*\n+/i, '');
+  return cleaned.split(/\n\n+/).map((block, i) => {
+    const lines = block.split('\n').filter(Boolean);
+    const timeLine = lines.find((l) => l.includes('-->'));
+    if (!timeLine) return null;
+    const [start, end] = timeLine.split('-->').map((s) => s.trim());
+    const text = lines.slice(lines.indexOf(timeLine) + 1).join(' ').trim();
+    if (!text) return null;
+    return { index: i, startSec: toSec(start), endSec: toSec(end), text };
+  }).filter((c): c is { index: number; startSec: number; endSec: number; text: string } => c !== null);
+}
+
 // Authoritative real narration length: load the actual mp3 and read its
 // duration. Lumean's reported durationMs/cues are sometimes missing or wrong,
 // but the audio file itself never lies. Resolves 0 if it can't be measured.
@@ -95,6 +116,10 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
   const [selectedStyleId, setSelectedStyleId] = useState<string>(project.styleId);
   const [scriptTab, setScriptTab] = useState<'generate' | 'custom' | 'upload' | 'lumean'>('generate');
   const [uploadedAudio, setUploadedAudio] = useState<{ base64: string; mimeType: string; name: string; objectUrl: string } | null>(null);
+  // Optional SRT (or VTT) that accompanies the uploaded voiceover — if present,
+  // its real timecodes replace both the STT transcription and the block-timing
+  // estimate: shot boundaries land on the real pauses Lumean already recorded.
+  const [uploadedSrt, setUploadedSrt] = useState<{ name: string; cues: { index: number; startSec: number; endSec: number; text: string }[] } | null>(null);
   const [lumeanText, setLumeanText] = useState<string>('');
   const [lumeanResult, setLumeanResult] = useState<import('../services/geminiPipelineClient').SynthesizeVoiceResult | null>(null);
   const [isSynthesizing, setIsSynthesizing] = useState<boolean>(false);
@@ -286,26 +311,35 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
     setIsGeneratingScript(true);
     setScriptBatchProgress(null);
     try {
-      // Upload mode: transcribe the user's own voiceover first, then treat the
-      // transcript exactly like pasted custom text. The clip's real duration
-      // (measured server-side) drives shot timing instead of Lumean synthesis.
+      // Upload mode: prefer the user's SRT/VTT (authoritative pause-accurate
+      // timecodes) over Gemini STT. With an SRT: skip transcription entirely,
+      // use its cue texts as lines and its cue times to drive block timing.
+      // Without an SRT: fall back to Gemini transcription + measured mp3 length.
       let uploadedDurationMs = 0;
       let linesForRun = customScriptLines;
+      let uploadedCues: { index: number; startSec: number; endSec: number; text: string }[] = [];
       if (scriptTab === 'upload' && uploadedAudio) {
-        showToast('🎧 Расшифровываю загруженную озвучку…');
-        const tr = await transcribeVoiceReal({
-          audioBase64: uploadedAudio.base64,
-          mimeType: uploadedAudio.mimeType,
-          language: scriptLanguage,
-        });
-        if (tr.error || !tr.text) {
-          showToast(`❌ Не удалось расшифровать аудио (${tr.error || 'пустой ответ'})`);
-          setIsGeneratingScript(false);
-          return;
+        if (uploadedSrt?.cues?.length) {
+          uploadedCues = uploadedSrt.cues;
+          linesForRun = uploadedCues.map((c) => c.text);
+          uploadedDurationMs = Math.round(uploadedCues[uploadedCues.length - 1].endSec * 1000);
+          showToast(`📄 Использую загруженные таймкоды: ${linesForRun.length} сегментов, длина ${Math.round(uploadedDurationMs / 1000)} сек — расшифровка не нужна.`);
+        } else {
+          showToast('🎧 Расшифровываю загруженную озвучку…');
+          const tr = await transcribeVoiceReal({
+            audioBase64: uploadedAudio.base64,
+            mimeType: uploadedAudio.mimeType,
+            language: scriptLanguage,
+          });
+          if (tr.error || !tr.text) {
+            showToast(`❌ Не удалось расшифровать аудио (${tr.error || 'пустой ответ'})`);
+            setIsGeneratingScript(false);
+            return;
+          }
+          uploadedDurationMs = tr.durationMs || 0;
+          linesForRun = splitScriptIntoSentenceLines(tr.text);
+          showToast(`📝 Расшифровано: ${linesForRun.length} предложений${uploadedDurationMs ? `, длина аудио ${Math.round(uploadedDurationMs / 1000)} сек` : ''}.`);
         }
-        uploadedDurationMs = tr.durationMs || 0;
-        linesForRun = splitScriptIntoSentenceLines(tr.text);
-        showToast(`📝 Расшифровано: ${linesForRun.length} предложений${uploadedDurationMs ? `, длина аудио ${Math.round(uploadedDurationMs / 1000)} сек` : ''}.`);
       }
       // A single structured-output call reliably handles ~20-25 detailed
       // blocks (full 9-field director prompts each) — past that it gets
@@ -434,6 +468,22 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
         motionType: b.motionType,
         transition: 'crossfade',
       }));
+
+      // Pause-accurate timing from an uploaded SRT: each block runs from its
+      // first cue's start to the next block's first cue start (last block to
+      // audio end), so shot boundaries land on the real recorded pauses.
+      if (scriptTab === 'upload' && uploadedCues.length && res.blocks.some((b) => b.sourceLineIndices?.length)) {
+        const totalSec = uploadedCues[uploadedCues.length - 1].endSec;
+        const starts = res.blocks.map((b) => {
+          const idxs = (b.sourceLineIndices || []).filter((n) => n >= 1 && n <= uploadedCues.length);
+          return idxs.length ? uploadedCues[Math.min(...idxs) - 1].startSec : 0;
+        });
+        newScenes.forEach((s, idx) => {
+          const dur = (idx + 1 < starts.length ? starts[idx + 1] : totalSec) - starts[idx];
+          if (dur > 0) s.duration = Number(dur.toFixed(2));
+        });
+        showToast(`🎯 Тайминг взят из загруженных таймкодов (${Math.round(totalSec)} сек) — реже по паузам.`);
+      }
 
       setHeroName(res.heroMaster.name);
 
@@ -768,15 +818,38 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
       'zoom-in', 'pan-left', 'zoom-out', 'pan-right', 'zoom-in', 'static'
     ];
 
-    const updatedScenes: StoryScene[] = [];
     let anySimulated = false;
     let engineUsed: string | undefined;
     const activeCustomStyle = customStyles.find((s) => s.id === selectedStyleId);
 
+    // Seed the scene list once so 157 empty placeholder cards appear immediately
+    // in "Материалы" — each card fills in with its real image as the loop
+    // advances, instead of the whole grid appearing only after the last shot.
+    // Reuses existing scene rows (with their AI-decided duration/motion) when
+    // possible, so the timeline built earlier isn't reset by the batch pass.
+    const scenesRef: StoryScene[] = effectiveLines.map((line, idx) => {
+      const sceneId = idx + 1;
+      const cleanPrompt = line.replace(/^\d+[\.\)]\s*/, '').trim();
+      const existing = project.scenes[idx];
+      return existing
+        ? { ...existing, id: sceneId, prompt: cleanPrompt, generatedImageUrl: undefined }
+        : {
+            id: sceneId,
+            title: `План ${sceneId < 10 ? '0' : ''}${sceneId}: ${cleanPrompt.slice(0, 32)}...`,
+            duration: estimateSpeechDuration(cleanPrompt),
+            description: cleanPrompt,
+            prompt: cleanPrompt,
+            generatedImageUrl: undefined,
+            motionType: motions[idx % motions.length],
+            transition: sceneId % 3 === 0 ? 'fade-black' : 'crossfade',
+          };
+    });
+    onUpdateProject({ scenes: scenesRef, scenesCount: scenesRef.length, aspectRatio: selectedRatio, model: selectedModel, styleId: selectedStyleId });
+
     for (let idx = 0; idx < effectiveLines.length; idx++) {
       const sceneId = idx + 1;
       const cleanPrompt = effectiveLines[idx].replace(/^\d+[\.\)]\s*/, '').trim();
-      const title = `План ${sceneId < 10 ? '0' : ''}${sceneId}: ${cleanPrompt.slice(0, 32)}...`;
+      const title = scenesRef[idx].title;
       setBatchStatusMsg(`Генерация кадра ${sceneId} из ${effectiveLines.length} (${activeModel.name})...`);
 
       const styledPrompt = activeCustomStyle?.negativePrompt
@@ -798,32 +871,28 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
         ? `data:${imgRes.mimeType};base64,${imgRes.imageBase64}`
         : generateSceneThumbnailDataUrl(sceneId, title, cleanPrompt, selectedRatio, selectedStyleId);
 
-      updatedScenes.push({
-        id: sceneId,
-        title,
-        duration: estimateSpeechDuration(cleanPrompt),
-        description: cleanPrompt,
-        prompt: cleanPrompt,
-        generatedImageUrl,
-        motionType: motions[idx % motions.length],
-        transition: sceneId % 3 === 0 ? 'fade-black' : 'crossfade',
-      });
+      // Push the shot into the project as soon as it's ready so "Материалы"
+      // fills in live — the batch no longer waits until frame 157 to reveal
+      // frame 1. Mid-batch per-shot regeneration is intentionally disabled in
+      // the UI to avoid racing this write.
+      scenesRef[idx] = { ...scenesRef[idx], generatedImageUrl };
+      onUpdateProject({ scenes: [...scenesRef] });
 
       setBatchProgress(Math.round(((idx + 1) / effectiveLines.length) * 100));
     }
 
     // Build perfectly synchronized timeline matching voice lines
     const { timelineClips, totalDuration } = buildSynchronizedTimeline(
-      updatedScenes,
+      scenesRef,
       selectedRatio,
       selectedStyleId,
       project.clipHoldDuration || 4.0
     );
 
     onUpdateProject({
-      scenes: updatedScenes,
-      scenesCount: updatedScenes.length,
-      imagesCount: (project.imagesCount || 0) + updatedScenes.length,
+      scenes: scenesRef,
+      scenesCount: scenesRef.length,
+      imagesCount: (project.imagesCount || 0) + scenesRef.length,
       timelineClips,
       duration: totalDuration,
       aspectRatio: selectedRatio,
@@ -831,7 +900,7 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
       styleId: selectedStyleId
     });
 
-    setLastGeneratedScenes(updatedScenes);
+    setLastGeneratedScenes(scenesRef);
     setJustGenerated(true);
     setIsBatchGenerating(false);
     setBatchStatusMsg('');
@@ -841,7 +910,7 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
     if (anySimulated) {
       showToast('⚠️ Часть или все кадры не удалось сгенерировать реально — использованы заглушки. Проверьте подключение Flow (кнопка входа) или GEMINI_API_KEY.');
     } else {
-      showToast(`🎉 Успешно сгенерировано ${updatedScenes.length} кадров реально (движок: ${engineUsed === 'flow' ? 'Google Flow' : 'Gemini API'})!`);
+      showToast(`🎉 Успешно сгенерировано ${scenesRef.length} кадров реально (движок: ${engineUsed === 'flow' ? 'Google Flow' : 'Gemini API'})!`);
     }
   };
 
@@ -1439,6 +1508,46 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
                     </div>
                   </label>
 
+                  {/* Optional SRT/VTT — when present, skips STT and cuts shots on the real recorded pauses */}
+                  <label className="block cursor-pointer">
+                    <div className="w-full bg-[#140f0b] border border-dashed border-[#2f2418] hover:border-amber-500/60 rounded-xl p-3 text-center transition-colors">
+                      <input
+                        type="file"
+                        accept=".srt,.vtt,text/plain"
+                        className="hidden"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (!file) return;
+                          const reader = new FileReader();
+                          reader.onload = () => {
+                            const cues = parseSrtOrVttText(String(reader.result || ''));
+                            if (!cues.length) {
+                              showToast('❌ SRT/VTT не удалось разобрать — проверь формат.');
+                              return;
+                            }
+                            setUploadedSrt({ name: file.name, cues });
+                            showToast(`📄 Таймкоды загружены: ${cues.length} сегментов, ${Math.round(cues[cues.length - 1].endSec)} сек.`);
+                          };
+                          reader.readAsText(file);
+                        }}
+                      />
+                      {uploadedSrt ? (
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="text-[11px] text-emerald-300 font-mono truncate">📄 {uploadedSrt.name} · {uploadedSrt.cues.length} таймкодов</span>
+                          <button
+                            type="button"
+                            onClick={(ev) => { ev.preventDefault(); setUploadedSrt(null); }}
+                            className="text-[10px] text-stone-400 hover:text-rose-300 font-mono shrink-0"
+                          >убрать</button>
+                        </div>
+                      ) : (
+                        <p className="text-[11px] text-stone-500 font-mono">
+                          + Опционально: .srt / .vtt с точными таймкодами. Если есть — расшифровка пропускается и кадры режутся по реальным паузам из файла.
+                        </p>
+                      )}
+                    </div>
+                  </label>
+
                   <div className="flex items-center gap-2">
                     <span className="text-xs font-mono uppercase text-stone-400">Язык озвучки:</span>
                     <select
@@ -1994,7 +2103,7 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
             <div className="p-5 rounded-2xl bg-[#140f0b] border border-[#2b2116] space-y-3">
               <div className="flex items-center justify-between gap-2">
                 <span className="text-xs font-bold uppercase tracking-wider text-stone-300 font-mono">
-                  Материалы · {project.scenes.filter(s => s.generatedImageUrl).length}
+                  Материалы · {project.scenes.filter(s => s.generatedImageUrl).length}{project.scenes.length ? ` из ${project.scenes.length}` : ''}
                 </span>
                 {project.scenes.some(s => s.generatedImageUrl) && (
                   <button
@@ -2014,26 +2123,37 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
                 )}
               </div>
 
-              {project.scenes.filter(s => s.generatedImageUrl).length === 0 ? (
+              {project.scenes.length === 0 ? (
                 <p className="text-[11px] text-stone-400 leading-relaxed">
                   Пусто. Запусти пачку с выбранным проектом — результаты лягут сюда сами. Или добавь готовое из «Моих работ».
                 </p>
               ) : (
                 <div className="space-y-2.5 max-h-[520px] overflow-y-auto pr-1">
-                  {project.scenes.filter(s => s.generatedImageUrl).map((sc) => (
+                  {project.scenes.map((sc) => (
                     <div
                       key={sc.id}
                       className="rounded-xl overflow-hidden bg-[#0f0b08] border border-[#2b2116] hover:border-amber-500/40 transition-colors"
                     >
                       <div
-                        onClick={() => setPreviewScene(sc)}
-                        className="relative aspect-video cursor-pointer group"
-                        title={`План ${sc.id} — открыть превью`}
+                        onClick={() => sc.generatedImageUrl && setPreviewScene(sc)}
+                        className={`relative aspect-video group ${sc.generatedImageUrl ? 'cursor-pointer' : ''}`}
+                        title={sc.generatedImageUrl ? `План ${sc.id} — открыть превью` : `План ${sc.id} — ждёт генерации`}
                       >
-                        <img src={sc.generatedImageUrl} alt={`План ${sc.id}`} className="w-full h-full object-cover" />
-                        <div className="absolute inset-0 bg-black/0 group-hover:bg-black/30 transition-colors flex items-center justify-center">
-                          <span className="opacity-0 group-hover:opacity-100 text-[10px] text-white font-mono transition-opacity">Открыть превью</span>
-                        </div>
+                        {sc.generatedImageUrl ? (
+                          <>
+                            <img src={sc.generatedImageUrl} alt={`План ${sc.id}`} className="w-full h-full object-cover" />
+                            <div className="absolute inset-0 bg-black/0 group-hover:bg-black/30 transition-colors flex items-center justify-center">
+                              <span className="opacity-0 group-hover:opacity-100 text-[10px] text-white font-mono transition-opacity">Открыть превью</span>
+                            </div>
+                          </>
+                        ) : (
+                          <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#0b0806] gap-1">
+                            {isBatchGenerating ? <RefreshCw className="w-3.5 h-3.5 text-amber-400 animate-spin" /> : null}
+                            <span className="text-[10px] text-stone-500 font-mono">
+                              {isBatchGenerating ? 'Генерируется…' : 'Ждёт генерации'}
+                            </span>
+                          </div>
+                        )}
                         {regeneratingSceneId === sc.id && (
                           <div className="absolute inset-0 bg-black/70 flex items-center justify-center">
                             <RefreshCw className="w-4 h-4 text-amber-400 animate-spin" />
@@ -2048,9 +2168,15 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
                           <button
                             type="button"
                             onClick={() => handleRegenerateScene(sc.id)}
-                            disabled={regeneratingSceneId !== null}
+                            disabled={regeneratingSceneId !== null || !sc.generatedImageUrl || isBatchGenerating}
                             className="flex items-center gap-1 px-2 py-1 rounded-md bg-[#1c150e] hover:bg-[#2c2117] border border-[#382a1d] text-stone-300 hover:text-amber-300 text-[10px] font-mono transition-colors disabled:opacity-40 shrink-0"
-                            title="Перегенерировать этот кадр"
+                            title={
+                              isBatchGenerating
+                                ? 'Идёт пачка — дождись окончания'
+                                : sc.generatedImageUrl
+                                ? 'Перегенерировать этот кадр'
+                                : 'Кадр ещё не сгенерирован'
+                            }
                           >
                             <RefreshCw className={`w-3 h-3 ${regeneratingSceneId === sc.id ? 'animate-spin' : ''}`} />
                             <span>Перегенерировать</span>
