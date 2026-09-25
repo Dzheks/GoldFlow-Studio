@@ -395,8 +395,52 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
         showToast(`⚠️ Озвучка не удалась (${err?.message || 'ошибка'}) — тайминг остался оценочным.`);
       }
 
-      const { timelineClips, totalDuration } = buildSynchronizedTimeline(newScenes, selectedRatio, selectedStyleId);
-      onUpdateProject({ scriptText: fullScript, scenes: newScenes, timelineClips, duration: totalDuration, narrationAudioUrl, heroName: res.heroMaster.name });
+      // An AI "block" is grouped by scene change (place/time/character), NOT by
+      // duration — so one block can carry 40-60 sec of narration. Rendered as a
+      // single still it becomes one absurdly long Ken Burns pan, and an 11-min
+      // script collapses to ~14 shots. Split any block longer than one shot's
+      // worth of narration into equal sub-shots that share the same
+      // nineFields/hero/location but vary the camera angle, so runtime actually
+      // drives shot count (693 sec → ~170+ shots, not 14).
+      const TARGET_SHOT_SECONDS = 4;
+      const MAX_SUBSHOTS = 12;
+      const CAMERA_ANGLES = [
+        'wide establishing shot', 'medium shot', 'close-up detail shot',
+        'over-the-shoulder angle', 'low-angle dramatic shot', 'high-angle overview',
+        'slow tracking side profile', 'reverse angle',
+      ];
+      const MOTION_CYCLE: StoryScene['motionType'][] = ['zoom-in', 'pan-left', 'zoom-out', 'pan-right'];
+      const expandedScenes: StoryScene[] = [];
+      newScenes.forEach((scene) => {
+        const n = Math.max(1, Math.min(MAX_SUBSHOTS, Math.round(scene.duration / TARGET_SHOT_SECONDS)));
+        if (n <= 1) {
+          expandedScenes.push(scene);
+          return;
+        }
+        const per = Number((scene.duration / n).toFixed(2));
+        for (let i = 0; i < n; i++) {
+          const angle = CAMERA_ANGLES[i % CAMERA_ANGLES.length];
+          expandedScenes.push({
+            ...scene,
+            id: 0,
+            title: `${scene.title} · ракурс ${i + 1}/${n}`,
+            duration: per,
+            prompt: `${scene.prompt}. Camera angle ${i + 1} of ${n} for this same moment: ${angle}`,
+            motionType: MOTION_CYCLE[i % MOTION_CYCLE.length],
+          });
+        }
+      });
+      expandedScenes.forEach((s, idx) => { s.id = idx + 1; });
+
+      // Rebuild the visible prompt list + montage from the real shot count.
+      const expandedPromptsText = expandedScenes.map((s, i) => `${i + 1}. ${s.prompt}`).join('\n');
+      setPromptsText(expandedPromptsText);
+      if (expandedScenes.length > newScenes.length) {
+        showToast(`🎬 ${newScenes.length} сцен разбито на ${expandedScenes.length} кадров по ~${TARGET_SHOT_SECONDS} сек (под реальный хронометраж озвучки).`);
+      }
+
+      const { timelineClips, totalDuration } = buildSynchronizedTimeline(expandedScenes, selectedRatio, selectedStyleId);
+      onUpdateProject({ scriptText: fullScript, scenes: expandedScenes, timelineClips, duration: totalDuration, narrationAudioUrl, heroName: res.heroMaster.name });
 
       // Generate the hero reference image now, once — every scene in
       // handleRunBatch reuses it for character consistency (п.04). It must
