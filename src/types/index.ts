@@ -56,6 +56,12 @@ export interface StoryScene {
   videoUrl?: string;
   motionType: 'zoom-in' | 'zoom-out' | 'pan-left' | 'pan-right' | 'static';
   transition: 'crossfade' | 'fade-black' | 'zoom' | 'cut';
+  // Which reference face this shot uses. Undefined/'hero' = the AI-created
+  // story protagonist (existing behavior, unchanged). 'narrator' = the
+  // separate host/narrator reference — for on-camera host shots that are a
+  // different person from the story being reenacted. 'none' = no face
+  // reference at all.
+  castRole?: 'hero' | 'narrator' | 'none';
 }
 
 export interface TimelineClip {
@@ -97,6 +103,10 @@ export interface ProjectData {
   customStyles: StylePreset[];
   heroRefImage?: { base64: string; mimeType: string } | null;
   heroName?: string;
+  // Separate reference face for an on-camera narrator/host — distinct person
+  // from the story's own protagonist (heroRefImage). Optional, user-supplied.
+  narratorRefImage?: { base64: string; mimeType: string } | null;
+  narratorName?: string;
   model: string;
   autoTransitions: boolean;
   syncWithVoice: boolean;

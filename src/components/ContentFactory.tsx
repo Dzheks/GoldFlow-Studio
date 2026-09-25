@@ -181,6 +181,12 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
   const [editingStyleId, setEditingStyleId] = useState<string | null>(null);
   const [heroRefImage, setHeroRefImage] = useState<{ base64: string; mimeType: string } | null>(project.heroRefImage || null);
   const [heroName, setHeroName] = useState<string>(project.heroName || '');
+  // Separate narrator/host reference — a real person's photo the user
+  // uploads, distinct from the AI-generated story hero. Used only on scenes
+  // explicitly marked castRole==='narrator'.
+  const [narratorRefImage, setNarratorRefImage] = useState<{ base64: string; mimeType: string } | null>(project.narratorRefImage || null);
+  const [narratorName, setNarratorName] = useState<string>(project.narratorName || '');
+  const [isNarratorPreviewOpen, setIsNarratorPreviewOpen] = useState<boolean>(false);
   const [nineFieldsScene, setNineFieldsScene] = useState<StoryScene | null>(null);
   const [isBatchCompleteModalOpen, setIsBatchCompleteModalOpen] = useState<boolean>(false);
   const [lastGeneratedScenes, setLastGeneratedScenes] = useState<StoryScene[]>([]);
@@ -969,11 +975,15 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
         ? `${cleanPrompt}. Avoid: ${activeCustomStyle.negativePrompt}`
         : cleanPrompt;
 
+      // castRole picks which face reference goes in: the story's own hero
+      // (default) or the separate narrator/host reference for shots marked
+      // as such in "Материалы".
+      const faceRef = scenesRef[idx].castRole === 'narrator' ? narratorRefImage : heroRefImage;
       const imgRes = await generateImageReal({
         prompt: styledPrompt,
         modelCode: selectedModel,
         aspectRatio: selectedRatio,
-        heroReferenceImage: heroRefImage || undefined,
+        heroReferenceImage: faceRef || undefined,
         styleReferenceImages: activeCustomStyle?.referenceImages,
         castReferences: buildCastReferences(cleanPrompt),
       });
@@ -1044,11 +1054,12 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
         ? `${scene.prompt}. Avoid: ${activeCustomStyle.negativePrompt}`
         : scene.prompt;
 
+      const faceRef = scene.castRole === 'narrator' ? narratorRefImage : heroRefImage;
       const imgRes = await generateImageReal({
         prompt: styledPrompt,
         modelCode: selectedModel,
         aspectRatio: selectedRatio,
-        heroReferenceImage: heroRefImage || undefined,
+        heroReferenceImage: faceRef || undefined,
         styleReferenceImages: activeCustomStyle?.referenceImages,
         castReferences: buildCastReferences(scene.prompt),
       });
@@ -2013,6 +2024,71 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
                     </button>
                   </div>
                 )}
+
+                {/* Narrator/host reference — a real person, separate from the
+                    story's own hero. Upload once, then mark specific scenes
+                    below (in Материалы) as "рассказчик", and those shots use
+                    this face instead of the story hero's. */}
+                <div className="flex flex-wrap items-center gap-2 px-3 py-2 rounded-xl bg-sky-950/20 border border-sky-500/30 text-[11px] font-mono text-sky-300">
+                  {narratorRefImage ? (
+                    <>
+                      <img
+                        src={`data:${narratorRefImage.mimeType};base64,${narratorRefImage.base64}`}
+                        alt="narrator"
+                        onClick={() => setIsNarratorPreviewOpen(true)}
+                        className="w-6 h-6 rounded object-cover border border-sky-500/40 cursor-pointer hover:ring-2 hover:ring-sky-400/60 transition-all shrink-0"
+                        title="Посмотреть референс рассказчика"
+                      />
+                      <input
+                        value={narratorName}
+                        onChange={(e) => {
+                          setNarratorName(e.target.value);
+                          onUpdateProject({ narratorName: e.target.value });
+                        }}
+                        placeholder="Имя рассказчика"
+                        className="bg-transparent border-b border-sky-700/40 focus:border-sky-400 outline-none text-sky-200 w-28"
+                      />
+                      <span>— референс рассказчика подключён. Отметь кадры «рассказчик» ниже в «Материалах».</span>
+                      <button type="button" onClick={() => setIsNarratorPreviewOpen(true)} className="underline text-sky-300 hover:text-sky-200">Посмотреть</button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setNarratorRefImage(null);
+                          onUpdateProject({ narratorRefImage: null });
+                        }}
+                        className="ml-auto underline text-rose-300 hover:text-rose-200 shrink-0"
+                      >
+                        Убрать
+                      </button>
+                    </>
+                  ) : (
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <span>Рассказчик — другой человек, не герой истории?</span>
+                      <span className="px-2 py-1 rounded bg-sky-500/15 hover:bg-sky-500/25 border border-sky-500/40 text-sky-200">Загрузить фото рассказчика</span>
+                      <input
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (!file) return;
+                          const reader = new FileReader();
+                          reader.onload = () => {
+                            const dataUrl = String(reader.result || '');
+                            const base64 = dataUrl.replace(/^data:[^;]+;base64,/, '');
+                            const img = { base64, mimeType: file.type || 'image/jpeg' };
+                            setNarratorRefImage(img);
+                            onUpdateProject({ narratorRefImage: img, narratorName: narratorName || 'Рассказчик' });
+                            if (!narratorName) setNarratorName('Рассказчик');
+                            showToast('🎙️ Референс рассказчика загружен — теперь отметь нужные кадры в «Материалах».');
+                          };
+                          reader.readAsDataURL(file);
+                        }}
+                      />
+                    </label>
+                  )}
+                </div>
+
                 <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-xl bg-[#120d09] border border-[#261a10] text-[11px] font-mono text-stone-400">
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="text-stone-500">Параметры API:</span>
@@ -2353,6 +2429,24 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
                           {sc.description || sc.prompt}
                         </p>
                       </div>
+                      {narratorRefImage && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const nextRole: 'hero' | 'narrator' = sc.castRole === 'narrator' ? 'hero' : 'narrator';
+                            const updated = project.scenes.map((s) => s.id === sc.id ? { ...s, castRole: nextRole } : s);
+                            onUpdateProject({ scenes: updated });
+                          }}
+                          className={`shrink-0 px-2 py-1 rounded-md text-[10px] font-mono border transition-colors ${
+                            sc.castRole === 'narrator'
+                              ? 'bg-sky-500/20 border-sky-500/50 text-sky-300'
+                              : 'bg-[#1c150e] border-[#382a1d] text-stone-500 hover:text-stone-300'
+                          }`}
+                          title={sc.castRole === 'narrator' ? 'В кадре рассказчик — клик, чтобы вернуть героя истории' : 'Клик, чтобы поставить в этот кадр рассказчика вместо героя истории'}
+                        >
+                          {sc.castRole === 'narrator' ? '🎙️ Рассказчик' : '👤 Герой'}
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() => handleRegenerateScene(sc.id)}
@@ -2431,6 +2525,39 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
             </div>
             <p className="text-[11px] text-stone-500 leading-relaxed">
               Этот портрет передаётся как референс лица/внешности в каждый кадр пачки — так герой остаётся одним и тем же человеком от кадра к кадру.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Narrator Reference Preview Modal */}
+      {isNarratorPreviewOpen && narratorRefImage && (
+        <div
+          className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex items-center justify-center p-4 animate-in fade-in duration-200"
+          onClick={() => setIsNarratorPreviewOpen(false)}
+        >
+          <div
+            className="bg-[#16100c] border border-[#3b2b1d] rounded-2xl max-w-xl w-full overflow-hidden shadow-2xl space-y-3 p-5"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-[#2e2115] pb-3">
+              <h4 className="font-bold text-white text-sm">Референс рассказчика «{narratorName}»</h4>
+              <button
+                onClick={() => setIsNarratorPreviewOpen(false)}
+                className="w-7 h-7 rounded-full bg-[#261c13] hover:bg-[#382a1d] text-stone-300 flex items-center justify-center text-xs"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="relative rounded-xl overflow-hidden bg-black aspect-square max-h-[420px] flex items-center justify-center border border-[#2d2015]">
+              <img
+                src={`data:${narratorRefImage.mimeType};base64,${narratorRefImage.base64}`}
+                alt={`Референс рассказчика ${narratorName}`}
+                className="w-full h-full object-contain"
+              />
+            </div>
+            <p className="text-[11px] text-stone-500 leading-relaxed">
+              Это отдельный от героя истории человек — используется только в кадрах, отмеченных как «рассказчик» в «Материалах».
             </p>
           </div>
         </div>
