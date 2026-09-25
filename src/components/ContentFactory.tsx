@@ -382,12 +382,33 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
       let narrationAudioUrl: string | undefined;
       try {
         const voiceRes = await synthesizeVoiceReal({ text: fullScript, langCode: scriptLanguage });
-        if (voiceRes.audioUrl && voiceRes.cues?.length === newScenes.length) {
-          voiceRes.cues.forEach((cue, idx) => {
-            newScenes[idx].duration = Number((cue.endSec - cue.startSec).toFixed(2));
-          });
+        if (voiceRes.audioUrl) {
           narrationAudioUrl = voiceRes.audioUrl;
-          showToast('🎙️ Реальная озвучка синтезирована — тайминг кадров взят из настоящих таймкодов Lumean.');
+          const cues = voiceRes.cues || [];
+          // Real total spoken length: audio file duration first, else the last
+          // SRT cue's end. This is the number the whole video MUST match.
+          const realTotalSec =
+            (voiceRes.durationMs ? voiceRes.durationMs / 1000 : 0) ||
+            (cues.length ? cues[cues.length - 1].endSec : 0);
+
+          if (cues.length === newScenes.length) {
+            // Ideal: one cue per block — use each cue's real duration directly.
+            cues.forEach((cue, idx) => {
+              newScenes[idx].duration = Number((cue.endSec - cue.startSec).toFixed(2));
+            });
+            showToast('🎙️ Реальная озвучка синтезирована — тайминг кадров взят из настоящих таймкодов Lumean.');
+          } else if (realTotalSec > 0) {
+            // Cue count ≠ block count (Lumean splits by sentence, AI groups by
+            // scene). The char-estimate sum badly undershoots real audio, so
+            // scale every block so the TOTAL equals the real narration length,
+            // weighting by each block's text length (longer line = more time).
+            const weights = newScenes.map((s) => Math.max(1, (s.description || '').length));
+            const weightSum = weights.reduce((a, b) => a + b, 0);
+            newScenes.forEach((s, idx) => {
+              s.duration = Number(((weights[idx] / weightSum) * realTotalSec).toFixed(2));
+            });
+            showToast(`🎙️ Озвучка синтезирована (${Math.round(realTotalSec)} сек) — тайминг кадров подогнан под реальную длину аудио.`);
+          }
         } else if (voiceRes.error) {
           showToast(`⚠️ Озвучка не удалась (${voiceRes.error}) — тайминг остался оценочным по длине текста.`);
         }
