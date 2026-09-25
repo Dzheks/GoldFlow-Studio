@@ -411,17 +411,21 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
           // mp3's own duration, then Lumean's reported durationMs, then the last
           // SRT cue's end. This is the number the whole video MUST match.
           const measuredSec = await measureAudioDurationSec(voiceRes.audioUrl);
-          const realTotalSec =
-            measuredSec ||
-            (voiceRes.durationMs ? voiceRes.durationMs / 1000 : 0) ||
-            (cues.length ? cues[cues.length - 1].endSec : 0);
+          const durationMsSec = voiceRes.durationMs ? voiceRes.durationMs / 1000 : 0;
+          const lastCueSec = cues.length ? cues[cues.length - 1].endSec : 0;
+          const realTotalSec = measuredSec || durationMsSec || lastCueSec;
+          const srcLabel = measuredSec ? 'mp3' : durationMsSec ? 'durationMs' : lastCueSec ? 'cue' : 'нет';
+          // One diagnostic toast so a single run tells the whole story: which
+          // duration source won, its value, cue/block counts, estimate sum.
+          const estSum = Math.round(newScenes.reduce((a, s) => a + s.duration, 0));
+          showToast(`🔎 Аудио: mp3=${Math.round(measuredSec)}с, durationMs=${Math.round(durationMsSec)}с, cues=${cues.length}, блоков=${newScenes.length}, оценка=${estSum}с → взято ${srcLabel}=${Math.round(realTotalSec)}с`);
 
           if (cues.length === newScenes.length) {
             // Ideal: one cue per block — use each cue's real duration directly.
             cues.forEach((cue, idx) => {
               newScenes[idx].duration = Number((cue.endSec - cue.startSec).toFixed(2));
             });
-            showToast('🎙️ Реальная озвучка синтезирована — тайминг кадров взят из настоящих таймкодов Lumean.');
+            showToast('🎙️ Реальная озвучка синтезирована — тайминг кадров взят из настоящих таймкодов Lumean (1:1).');
           } else if (realTotalSec > 0) {
             // Cue count ≠ block count (Lumean splits by sentence, AI groups by
             // scene). The char-estimate sum badly undershoots real audio, so
@@ -481,9 +485,8 @@ export const ContentFactory: React.FC<ContentFactoryProps> = ({
       // Rebuild the visible prompt list + montage from the real shot count.
       const expandedPromptsText = expandedScenes.map((s, i) => `${i + 1}. ${s.prompt}`).join('\n');
       setPromptsText(expandedPromptsText);
-      if (expandedScenes.length > newScenes.length) {
-        showToast(`🎬 ${newScenes.length} сцен разбито на ${expandedScenes.length} кадров по ~${TARGET_SHOT_SECONDS} сек (под реальный хронометраж озвучки).`);
-      }
+      const finalTotalSec = Math.round(expandedScenes.reduce((a, s) => a + s.duration, 0));
+      showToast(`🎬 Итог: ${newScenes.length} сцен → ${expandedScenes.length} кадров, суммарно ${finalTotalSec} сек ролика.`);
 
       const { timelineClips, totalDuration } = buildSynchronizedTimeline(expandedScenes, selectedRatio, selectedStyleId);
       onUpdateProject({ scriptText: fullScript, scenes: expandedScenes, timelineClips, duration: totalDuration, narrationAudioUrl, heroName: res.heroMaster.name });
